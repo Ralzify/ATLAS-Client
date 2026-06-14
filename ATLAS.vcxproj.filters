@@ -1,0 +1,150 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="ATLAS">
+      <UniqueIdentifier>{2a95123d-8afc-464a-a144-bc5e1b4bd259}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="ATLAS\Public">
+      <UniqueIdentifier>{12ccf323-ec61-43fd-9ca5-b42017765603}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="ATLAS\Private">
+      <UniqueIdentifier>{bf8a8013-2503-4be0-ab66-20ff33e3ec13}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="SDK">
+      <UniqueIdentifier>{a259d045-0ecd-499a-a864-d0b34ebe4068}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="ATLAS\ImGui">
+      <UniqueIdentifier>{628bbc07-37fa-4b7a-bbf0-98b6ab643096}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="ATLAS\Public\FortPlaylistAthena.h">
+      <Filter>ATLAS\Public</Filter>
+    </ClInclude>
+    <ClInclude Include="ATLAS\Public\FortPlayerControllerAthena.h">
+      <Filter>ATLAS\Public</Filter>
+    </ClInclude>
+    <ClInclude Include="ATLAS\Public\Client.h">
+      <Filter>ATLAS\Public</Filter>
+    </ClInclude>
+    <ClInclude Include="SDK\Core.h">
+      <Filter>SDK</Filter>
+    </ClInclude>
+    <ClInclude Include="SDK\Engine.h">
+      <Filter>SDK</Filter>
+    </ClInclude>
+    <ClInclude Include="SDK\Memcury.h">
+      <Filter>SDK</Filter>
+    </ClInclude>
+    <ClInclude Include="SDK\Containers.h">
+      <Filter>SDK</Filter>
+    </ClInclude>
+    <ClInclude Include="SDK\Defs.h">
+      <Filter>SDK</Filter>
+    </ClInclude>
+    <ClInclude Include="SDK\Offsets.h">
+      <Filter>SDK</Filter>
+    </ClInclude>
+    <ClInclude Include="SDK\Includes.h">
+      <Filter>SDK</Filter>
+    </ClInclude>
+    <ClInclude Include="ATLAS\Public\Configuration.h">
+      <Filter>ATLAS\Public</Filter>
+    </ClInclude>
+    <ClInclude Include="ATLAS\Public\BuildingSMActor.h">
+      <Filter>ATLAS\Public</Filter>
+    </ClInclude>
+    <ClInclude Include="ATLAS\Public\DataTable.h">
+      <Filter>ATLAS\Public</Filter>
+    </ClInclude>
+    <ClInclude Include="ATLAS\Public\CurveTable.h">
+      <Filter>ATLAS\Public</Filter>
+    </ClInclude>
+    <ClInclude Include="ATLAS\Public\Utils.h">
+      <Filter>ATLAS\Public</Filter>
+    </ClInclude>
+    <ClInclude Include="ATLAS\Public\Finders.h">
+      <Filter>ATLAS\Public</Filter>
+    </ClInclude>
+    <ClInclude Include="ATLAS\Public\MinHook.h">
+      <Filter>ATLAS\Public</Filter>
+    </ClInclude>
+    <ClInclude Include="ATLAS\Public\FortCheatManager.h">
+      <Filter>ATLAS\Public</Filter>
+    </ClInclude>
+    <ClInclude Include="pch.h">
+      <Filter>ATLAS\Public</Filter>
+    </ClInclude>
+    <ClInclude Include="ATLAS\ImGui\imgui_stdlib.h">
+      <Filter>ATLAS\ImGui</Filter>
+    </ClInclude>
+    <ClInclude Include="ATLAS\ImGui\imconfig.h">
+      <Filter>ATLAS\ImGui</Filter>
+    </ClInclude>
+    <ClInclude Include="ATLAS\ImGui\imgui.h">
+      <Filter>ATLAS\ImGui</Filter>
+    </ClInclude>
+    <ClInclude Include="ATLAS\ImGui\imgui_impl_dx11.h">
+      <Filter>ATLAS\ImGui</Filter>
+    </ClInclude>
+    <ClInclude Include="ATLAS\ImGui\imgui_impl_win32.h">
+      <Filter>ATLAS\ImGui</Filter>
+    </ClInclude>
+    <ClInclude Include="ATLAS\ImGui\imgui_internal.h">
+      <Filter>ATLAS\ImGui</Filter>
+    </ClInclude>
+    <ClInclude Include="ATLAS\ImGui\imstb_rectpack.h">
+      <Filter>ATLAS\ImGui</Filter>
+    </ClInclude>
+    <ClInclude Include="ATLAS\ImGui\imstb_textedit.h">
+      <Filter>ATLAS\ImGui</Filter>
+    </ClInclude>
+    <ClInclude Include="ATLAS\ImGui\imstb_truetype.h">
+      <Filter>ATLAS\ImGui</Filter>
+    </ClInclude>
+    <ClInclude Include="ATLAS\Public\Hotkey.h">
+      <Filter>ATLAS\Public</Filter>
+    </ClInclude>
+    <ClInclude Include="ATLAS\Public\GUI.h">
+      <Filter>ATLAS\Public</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="ATLAS\Private\dllmain.cpp">
+      <Filter>ATLAS\Private</Filter>
+    </ClCompile>
+    <ClCompile Include="ATLAS\Private\Client.cpp">
+      <Filter>ATLAS\Private</Filter>
+    </ClCompile>
+    <ClCompile Include="ATLAS\Private\Finders.cpp">
+      <Filter>ATLAS\Private</Filter>
+    </ClCompile>
+    <ClCompile Include="pch.cpp">
+      <Filter>ATLAS\Private</Filter>
+    </ClCompile>
+    <ClCompile Include="ATLAS\ImGui\imgui_stdlib.cpp">
+      <Filter>ATLAS\ImGui</Filter>
+    </ClCompile>
+    <ClCompile Include="ATLAS\ImGui\imgui_tables.cpp">
+      <Filter>ATLAS\ImGui</Filter>
+    </ClCompile>
+    <ClCompile Include="ATLAS\ImGui\imgui.cpp">
+      <Filter>ATLAS\ImGui</Filter>
+    </ClCompile>
+    <ClCompile Include="ATLAS\ImGui\imgui_draw.cpp">
+      <Filter>ATLAS\ImGui</Filter>
+    </ClCompile>
+    <ClCompile Include="ATLAS\ImGui\imgui_impl_dx11.cpp">
+      <Filter>ATLAS\ImGui</Filter>
+    </ClCompile>
+    <ClCompile Include="ATLAS\ImGui\imgui_impl_win32.cpp">
+      <Filter>ATLAS\ImGui</Filter>
+    </ClCompile>
+    <ClCompile Include="ATLAS\ImGui\imgui_widgets.cpp">
+      <Filter>ATLAS\ImGui</Filter>
+    </ClCompile>
+    <ClCompile Include="ATLAS\Private\GUI.cpp">
+      <Filter>ATLAS\Private</Filter>
+    </ClCompile>
+  </ItemGroup>
+</Project>
