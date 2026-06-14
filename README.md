@@ -12,43 +12,43 @@ ATLAS Console is a lightweight in-game overlay and client mod for OGFN private s
 
 
 
-\## Features
+## Features
 
 
 
-\### Overlay
+### Overlay
 
 
 
-\- Toggle the overlay in-game with a configurable hotkey (default: F9).
+- Toggle the overlay in-game with a configurable hotkey (default: F9).
 
-\- Hotkey is saved automatically and persists across sessions via `%APPDATA%\\ATLAS\\settings.json`.
+- Hotkey is saved automatically and persists across sessions via `%APPDATA%\\ATLAS\\settings.json`.
 
-\- Clean, non-intrusive UI — hidden until summoned, blocks no gameplay when closed.
-
-
-
-\### Editing
+- Clean, non-intrusive UI — hidden until summoned, blocks no gameplay when closed.
 
 
 
-\- \*\*Edit On Release (EOR)\*\* — Automatically completes a building edit on selection.
-
-\- \*\*Reset On Release (ROR)\*\* — Automatically completes a building reset on selection, toggled independently from EOR.
-
-\- \*\*Disable Pre-Edits\*\* — Prevents edits from being initiated on pre-edited structures.
+### Editing
 
 
 
-\### Respawning
+- **Edit On Release (EOR)** — Automatically completes a building edit on selection.
+
+- **Reset On Release (ROR)** — Automatically completes a building reset on selection, toggled independently from EOR.
+
+- **Disable Pre-Edits** — Prevents edits from being initiated on pre-edited structures.
 
 
 
-\- \*\*Force Respawns\*\* — Enables infinite respawns across all playlists.
+### Respawning
 
-\- \*\*Custom Respawn Time\*\* — Override the time between respawns (1–30 seconds).
 
-\- \*\*Custom Respawn Height\*\* — Override the height players respawn at in-air (1,000–50,000 units).
+
+- **Force Respawns** — Enables infinite respawns across all playlists.
+
+- **Custom Respawn Time** — Override the time between respawns (1–30 seconds).
+
+- **Custom Respawn Height** — Override the height players respawn at in-air (1,000–50,000 units).
 
 
 
@@ -56,27 +56,27 @@ ATLAS Console is a lightweight in-game overlay and client mod for OGFN private s
 
 
 
-\- \*\*Console Enabled\*\* — Spawns the Unreal Engine in-game console for direct command input.
+- **Console Enabled** — Spawns the Unreal Engine in-game console for direct command input.
 
-\- \*\*Potato Graphics\*\* — Applies `r.MipMapLODBias 7` for maximum FPS; revert restores `r.MipMapLODBias 0`.
+- **Potato Graphics** — Applies `r.MipMapLODBias 7` for maximum FPS; revert restores `r.MipMapLODBias 0`.
 
-\- \*\*FOV Slider\*\* — Set field of view from 0° to 175° via `fov <value>`.
+- **FOV Slider** — Set field of view from 0° to 175° via `fov <value>`.
 
-\- \*\*Resolution Dropdown\*\* — Switch between 1920×1080, 1720×1080, and 1280×720 via `setres`.
-
-
-
-\### Hotkeys
+- **Resolution Dropdown** — Switch between 1920×1080, 1720×1080 (stretched res), and 1280×720. Requires fullscreen.
 
 
 
-\- \*\*Rebind GUI Key\*\* — Reassign the overlay toggle to any F-key or navigation key.
-
-\- Binding is written to disk immediately and loaded on next inject.
+### Hotkeys
 
 
 
-\## Project Layout
+- **Rebind GUI Key** — Reassign the overlay toggle to any F-key or navigation key.
+
+- Binding is written to disk immediately and loaded on next inject.
+
+
+
+## Project Layout
 
 
 
@@ -130,43 +130,43 @@ ATLAS/
 
 
 
-\## Build Requirements
+## Build Requirements
 
 
 
-\- Windows 10 or newer.
+- Windows 10 or newer.
 
-\- Visual Studio 2022 with the \*\*Desktop development with C++\*\* workload.
+- Visual Studio 2022 with the **Desktop development with C++** workload.
 
-\- Windows SDK 10.0 or newer.
+- Windows SDK 10.0 or newer.
 
-\- DirectX 11 SDK (included with the Windows SDK).
+- DirectX 11 SDK (included with the Windows SDK).
 
-\- \[MinHook](https://github.com/TsudaKageyu/minhook) — included in project via `MinHook.h`.
+- [MinHook](https://github.com/TsudaKageyu/minhook) — included in project via `MinHook.h`.
 
-\- \[Memcury](https://github.com/kem0x/Memcury) — included in SDK for pattern scanning and PE utilities.
-
-
-
-\## Building
+- [Memcury](https://github.com/kem0x/Memcury) — included in SDK for pattern scanning and PE utilities.
 
 
 
-1\. Open `ATLAS.sln` in Visual Studio 2022.
-
-2\. Set the configuration to \*\*Release / x64\*\*.
-
-3\. Build → \*\*Build Solution\*\* (`Ctrl+Shift+B`).
-
-4\. The output DLL will be placed in `x64/Release/ATLAS.dll`.
+## Building
 
 
 
-> After modifying `pch.h`, always run \*\*Build → Clean Solution\*\* before rebuilding to force the precompiled header to regenerate.
+1. Open `ATLAS.sln` in Visual Studio 2022.
+
+2. Set the configuration to **Release / x64**.
+
+3. Build → **Build Solution** (`Ctrl+Shift+B`).
+
+4. The output DLL will be placed in `x64/Release/ATLAS.dll`.
 
 
 
-\## Injection
+> After modifying `pch.h`, always run **Build → Clean Solution** before rebuilding to force the precompiled header to regenerate.
+
+
+
+## Injection
 
 
 
@@ -175,7 +175,7 @@ The DLL is provided via ATLAS Link. If you are using our launcher, this is the d
 
 
 
-\## Hotkey Persistence
+## Hotkey Persistence
 
 
 
@@ -198,9 +198,7 @@ Example file:
 ```json
 
 {
-
-&#x20; "hotkey": 120
-
+  "hotkey": 120
 }
 
 ```
@@ -211,7 +209,7 @@ The value is a Windows Virtual Key code (e.g. `120` = F9). This file is created 
 
 
 
-\## Version Compatibility
+## Version Compatibility
 
 
 
@@ -241,13 +239,13 @@ ATLAS Console targets multiple Fortnite builds and engine versions. Version-spec
 
 
 
-\## Credits
+## Credits
 
 
 
-\- \[TsudaKageyu](https://github.com/TsudaKageyu) — \[MinHook](https://github.com/TsudaKageyu/minhook), used for function hooking.
+- [TsudaKageyu](https://github.com/TsudaKageyu) — [MinHook](https://github.com/TsudaKageyu/minhook), used for function hooking.
 
-\- \[kem0x](https://github.com/kem0x) — \[Memcury](https://github.com/kem0x/Memcury), used for pattern scanning and PE utilities.
+- [kem0x](https://github.com/kem0x) — [Memcury](https://github.com/kem0x/Memcury), used for pattern scanning and PE utilities.
 
-\- \[ocornut](https://github.com/ocornut) — \[Dear ImGui](https://github.com/ocornut/imgui), used for the overlay UI.
+- [ocornut](https://github.com/ocornut) — [Dear ImGui](https://github.com/ocornut/imgui), used for the overlay UI.
 
