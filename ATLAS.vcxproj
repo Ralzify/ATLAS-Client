@@ -28,6 +28,7 @@
     <ClInclude Include="ATLAS\ImGui\imstb_rectpack.h" />
     <ClInclude Include="ATLAS\ImGui\imstb_textedit.h" />
     <ClInclude Include="ATLAS\ImGui\imstb_truetype.h" />
+    <ClInclude Include="ATLAS\ImGui\stb_image.h" />
     <ClInclude Include="ATLAS\Public\BuildingSMActor.h" />
     <ClInclude Include="ATLAS\Public\Client.h" />
     <ClInclude Include="ATLAS\Public\Configuration.h" />
@@ -41,6 +42,7 @@
     <ClInclude Include="ATLAS\Public\Hotkey.h" />
     <ClInclude Include="ATLAS\Public\MinHook.h" />
     <ClInclude Include="ATLAS\Public\Utils.h" />
+    <ClInclude Include="Icon.h" />
     <ClInclude Include="pch.h" />
     <ClInclude Include="SDK\Containers.h" />
     <ClInclude Include="SDK\Core.h" />

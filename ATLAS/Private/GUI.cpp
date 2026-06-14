@@ -3,10 +3,23 @@
 #include "../Public/Hotkey.h"
 #include "../Public/Configuration.h"
 #include "../Public/Client.h"
+#include "../Public/Icon.h"
 #include "../ImGui/imgui.h"
+
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_ONLY_PNG
+
+#include "../ImGui/stb_image.h"
 
 extern void* SelectEdit(void*);
 extern void* SelectReset(void*);
+
+#define ACCENT_R 0.f
+#define ACCENT_G 0.635f
+#define ACCENT_B 0.808f
+
+static ImVec4 Accent(float a = 1.f) { return ImVec4(ACCENT_R, ACCENT_G, ACCENT_B, a); }
+static ImVec4 AccentDk(float a = 1.f) { return ImVec4(0.f, 0.38f, 0.50f, a); }  // darker for active
 
 static const char* VKName(int vk)
 {
@@ -28,11 +41,47 @@ static const char* VKName(int vk)
 void FGUI::SaveHotkey() { HotkeyPersist::Save(FGUI::HotkeyVK); }
 void FGUI::LoadHotkey() { FGUI::HotkeyVK = HotkeyPersist::Load(VK_F9); }
 
-static void PushATLASStyle()
+void GUI_LoadTextures(ID3D11Device* device)
+{
+    int w, h, ch;
+    unsigned char* pixels = stbi_load_from_memory(
+        g_AtlasLogoPNG, (int)g_AtlasLogoSize, &w, &h, &ch, 4);
+    if (!pixels) return;
+
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = (UINT)w;
+    desc.Height = (UINT)h;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+    D3D11_SUBRESOURCE_DATA initData{};
+    initData.pSysMem = pixels;
+    initData.SysMemPitch = (UINT)(w * 4);
+
+    ID3D11Texture2D* tex = nullptr;
+    if (SUCCEEDED(device->CreateTexture2D(&desc, &initData, &tex)))
+    {
+        D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+        srvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        srvDesc.Texture2D.MipLevels = 1;
+        device->CreateShaderResourceView(tex, &srvDesc, &FGUI::LogoTexture);
+        tex->Release();
+        FGUI::LogoW = w;
+        FGUI::LogoH = h;
+    }
+
+    stbi_image_free(pixels);
+}
+
+static void PushStyle()
 {
     ImGuiStyle& s = ImGui::GetStyle();
 
-    // Geometry
     s.WindowRounding = 8.f;
     s.ChildRounding = 6.f;
     s.FrameRounding = 4.f;
@@ -40,7 +89,6 @@ static void PushATLASStyle()
     s.PopupRounding = 4.f;
     s.ScrollbarRounding = 4.f;
     s.TabRounding = 4.f;
-
     s.WindowPadding = { 16.f, 14.f };
     s.FramePadding = { 10.f,  5.f };
     s.ItemSpacing = { 8.f,  7.f };
@@ -51,92 +99,69 @@ static void PushATLASStyle()
     s.WindowBorderSize = 1.f;
     s.FrameBorderSize = 0.f;
 
-    // ── Palette ──────────────────────────────────────────────────────────────
-    //   bg-deep   #0B0D12   base window fill
-    //   bg-panel  #111520   child / header panels
-    //   bg-frame  #181D2A   input/frame backgrounds
-    //   accent    #3DF5C8   primary interactive cyan-mint
-    //   accent-dk #1A8F73   darker accent (hover/active)
-    //   text      #D8E0F0   primary text
-    //   text-dim  #5A637A   disabled / muted text
-    //   border    #232A3E   subtle separator
-
     auto C = [](float r, float g, float b, float a = 1.f) { return ImVec4(r, g, b, a); };
-
     ImVec4* col = s.Colors;
+
     col[ImGuiCol_WindowBg] = C(0.043f, 0.051f, 0.071f, 0.97f);
     col[ImGuiCol_ChildBg] = C(0.066f, 0.082f, 0.122f, 1.f);
     col[ImGuiCol_PopupBg] = C(0.066f, 0.082f, 0.122f, 0.98f);
     col[ImGuiCol_Border] = C(0.137f, 0.165f, 0.243f, 1.f);
     col[ImGuiCol_BorderShadow] = C(0.f, 0.f, 0.f, 0.f);
-
     col[ImGuiCol_FrameBg] = C(0.094f, 0.114f, 0.165f, 1.f);
     col[ImGuiCol_FrameBgHovered] = C(0.12f, 0.145f, 0.21f, 1.f);
     col[ImGuiCol_FrameBgActive] = C(0.14f, 0.17f, 0.25f, 1.f);
-
     col[ImGuiCol_TitleBg] = C(0.043f, 0.051f, 0.071f, 1.f);
     col[ImGuiCol_TitleBgActive] = C(0.043f, 0.051f, 0.071f, 1.f);
     col[ImGuiCol_TitleBgCollapsed] = C(0.043f, 0.051f, 0.071f, 0.9f);
-
     col[ImGuiCol_ScrollbarBg] = C(0.043f, 0.051f, 0.071f, 0.f);
     col[ImGuiCol_ScrollbarGrab] = C(0.137f, 0.165f, 0.243f, 1.f);
-    col[ImGuiCol_ScrollbarGrabHovered] = C(0.239f, 0.96f, 0.784f, 0.5f);
-    col[ImGuiCol_ScrollbarGrabActive] = C(0.239f, 0.96f, 0.784f, 1.f);
-
-    col[ImGuiCol_CheckMark] = C(0.239f, 0.96f, 0.784f, 1.f);
-    col[ImGuiCol_SliderGrab] = C(0.239f, 0.96f, 0.784f, 1.f);
-    col[ImGuiCol_SliderGrabActive] = C(0.102f, 0.561f, 0.451f, 1.f);
-
+    col[ImGuiCol_ScrollbarGrabHovered] = Accent(0.5f);
+    col[ImGuiCol_ScrollbarGrabActive] = Accent(1.f);
+    col[ImGuiCol_CheckMark] = Accent();
+    col[ImGuiCol_SliderGrab] = Accent();
+    col[ImGuiCol_SliderGrabActive] = AccentDk();
     col[ImGuiCol_Button] = C(0.094f, 0.114f, 0.165f, 1.f);
-    col[ImGuiCol_ButtonHovered] = C(0.239f, 0.96f, 0.784f, 0.18f);
-    col[ImGuiCol_ButtonActive] = C(0.239f, 0.96f, 0.784f, 0.32f);
-
-    col[ImGuiCol_Header] = C(0.239f, 0.96f, 0.784f, 0.14f);
-    col[ImGuiCol_HeaderHovered] = C(0.239f, 0.96f, 0.784f, 0.22f);
-    col[ImGuiCol_HeaderActive] = C(0.239f, 0.96f, 0.784f, 0.32f);
-
+    col[ImGuiCol_ButtonHovered] = Accent(0.18f);
+    col[ImGuiCol_ButtonActive] = Accent(0.32f);
+    col[ImGuiCol_Header] = Accent(0.14f);
+    col[ImGuiCol_HeaderHovered] = Accent(0.22f);
+    col[ImGuiCol_HeaderActive] = Accent(0.32f);
     col[ImGuiCol_Separator] = C(0.137f, 0.165f, 0.243f, 1.f);
-    col[ImGuiCol_SeparatorHovered] = C(0.239f, 0.96f, 0.784f, 0.4f);
-    col[ImGuiCol_SeparatorActive] = C(0.239f, 0.96f, 0.784f, 1.f);
-
+    col[ImGuiCol_SeparatorHovered] = Accent(0.4f);
+    col[ImGuiCol_SeparatorActive] = Accent(1.f);
     col[ImGuiCol_ResizeGrip] = C(0.f, 0.f, 0.f, 0.f);
     col[ImGuiCol_ResizeGripHovered] = C(0.f, 0.f, 0.f, 0.f);
     col[ImGuiCol_ResizeGripActive] = C(0.f, 0.f, 0.f, 0.f);
-
     col[ImGuiCol_Tab] = C(0.066f, 0.082f, 0.122f, 1.f);
-    col[ImGuiCol_TabHovered] = C(0.239f, 0.96f, 0.784f, 0.2f);
+    col[ImGuiCol_TabHovered] = Accent(0.2f);
     col[ImGuiCol_TabActive] = C(0.094f, 0.114f, 0.165f, 1.f);
     col[ImGuiCol_TabUnfocused] = col[ImGuiCol_Tab];
     col[ImGuiCol_TabUnfocusedActive] = col[ImGuiCol_TabActive];
-
     col[ImGuiCol_Text] = C(0.847f, 0.878f, 0.941f, 1.f);
     col[ImGuiCol_TextDisabled] = C(0.353f, 0.388f, 0.478f, 1.f);
-
-    col[ImGuiCol_PlotLines] = C(0.239f, 0.96f, 0.784f, 1.f);
-    col[ImGuiCol_PlotLinesHovered] = C(0.239f, 0.96f, 0.784f, 1.f);
-    col[ImGuiCol_PlotHistogram] = C(0.239f, 0.96f, 0.784f, 1.f);
-    col[ImGuiCol_PlotHistogramHovered] = C(0.102f, 0.561f, 0.451f, 1.f);
-
+    col[ImGuiCol_PlotLines] = Accent();
+    col[ImGuiCol_PlotLinesHovered] = Accent();
+    col[ImGuiCol_PlotHistogram] = Accent();
+    col[ImGuiCol_PlotHistogramHovered] = AccentDk();
     col[ImGuiCol_TableHeaderBg] = C(0.066f, 0.082f, 0.122f, 1.f);
     col[ImGuiCol_TableBorderLight] = C(0.137f, 0.165f, 0.243f, 1.f);
     col[ImGuiCol_TableBorderStrong] = C(0.137f, 0.165f, 0.243f, 1.f);
     col[ImGuiCol_TableRowBg] = C(0.f, 0.f, 0.f, 0.f);
     col[ImGuiCol_TableRowBgAlt] = C(1.f, 1.f, 1.f, 0.03f);
-
-    col[ImGuiCol_DragDropTarget] = C(0.239f, 0.96f, 0.784f, 0.8f);
-    col[ImGuiCol_NavHighlight] = C(0.239f, 0.96f, 0.784f, 1.f);
+    col[ImGuiCol_DragDropTarget] = Accent(0.8f);
+    col[ImGuiCol_NavHighlight] = Accent();
     col[ImGuiCol_NavWindowingHighlight] = C(1.f, 1.f, 1.f, 0.7f);
     col[ImGuiCol_NavWindowingDimBg] = C(0.8f, 0.8f, 0.8f, 0.2f);
-    col[ImGuiCol_ModalWindowDimBg] = C(0.0f, 0.0f, 0.0f, 0.55f);
+    col[ImGuiCol_ModalWindowDimBg] = C(0.f, 0.f, 0.f, 0.55f);
 }
 
 static void SectionLabel(const char* label)
 {
     ImGui::Spacing();
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.239f, 0.96f, 0.784f, 0.85f));
+    ImGui::PushStyleColor(ImGuiCol_Text, Accent(0.85f));
     ImGui::TextUnformatted(label);
     ImGui::PopStyleColor();
-    ImGui::PushStyleColor(ImGuiCol_Separator, ImVec4(0.239f, 0.96f, 0.784f, 0.25f));
+    ImGui::PushStyleColor(ImGuiCol_Separator, Accent(0.25f));
     ImGui::Separator();
     ImGui::PopStyleColor();
     ImGui::Spacing();
@@ -151,26 +176,42 @@ static void Exec(const char* cmd)
 {
     if (!UWorld::GetWorld() || !UWorld::GetWorld()->OwningGameInstance) return;
     auto& lp = UWorld::GetWorld()->OwningGameInstance->LocalPlayers;
-    if (lp.Num() == 0) 
-        return;
-
+    if (lp.Num() == 0) return;
     auto pc = lp[0]->PlayerController;
-
-    if (!pc) 
-        return;
+    if (!pc) return;
 
     int len = MultiByteToWideChar(CP_UTF8, 0, cmd, -1, nullptr, 0);
     std::wstring ws(len - 1, L'\0');
     MultiByteToWideChar(CP_UTF8, 0, cmd, -1, ws.data(), len);
-    FString fs(ws.c_str());
+    UKismetSystemLibrary::ExecuteConsoleCommand(pc, FString(ws.c_str()));
+}
 
-	UKismetSystemLibrary::ExecuteConsoleCommand(pc, fs);
+static void SpawnConsole()
+{
+    auto Engine = UEngine::GetEngine();
+
+    if (Engine && Engine->GameViewport && Engine->ConsoleClass)
+        Engine->GameViewport->ViewportConsole = UGameplayStatics::SpawnObject(Engine->ConsoleClass, Engine->GameViewport);
+}
+
+static void DestroyConsole()
+{
+    auto Engine = UEngine::GetEngine();
+
+    if (Engine && Engine->GameViewport && Engine->GameViewport->ViewportConsole)
+    {
+        if (auto Console = Engine->GameViewport->ViewportConsole->Cast<AActor>())
+        {
+            Console->K2_DestroyActor();
+            Engine->GameViewport->ViewportConsole = nullptr;
+        }
+    }
 }
 
 void GUI_Init()
 {
     FGUI::LoadHotkey();
-    PushATLASStyle();
+    PushStyle();
 }
 
 void GUI_HandleInput()
@@ -206,7 +247,7 @@ void GUI_Render()
     if (!FGUI::bVisible) 
         return;
 
-    ImGuiWindowFlags wflags = ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus;
+    ImGuiWindowFlags wflags = ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoTitleBar;
 
     ImGuiIO& io = ImGui::GetIO();
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Once, ImVec2(0.5f, 0.5f));
@@ -221,106 +262,138 @@ void GUI_Render()
         ImDrawList* dl = ImGui::GetWindowDrawList();
         ImVec2 wp = ImGui::GetWindowPos();
         ImVec2 ws = ImGui::GetWindowSize();
-        dl->AddRectFilled(wp, ImVec2(wp.x + ws.x, wp.y + 3.f), IM_COL32(61, 245, 200, 255));
+        dl->AddRectFilled(wp, ImVec2(wp.x + ws.x, wp.y + 3.f), IM_COL32(0, 162, 206, 255));
     }
 
-    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 3.f);
-    ImGui::SetCursorPosX(16.f);
+    ImGui::SetCursorPosY(3.f);
 
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.239f, 0.96f, 0.784f, 1.f));
-    ImGui::Text("ATLAS");
-    ImGui::PopStyleColor();
-    ImGui::SameLine();
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.353f, 0.388f, 0.478f, 1.f));
-    ImGui::Text("| overlay");
-    ImGui::PopStyleColor();
+    // ── Header row: logo + title + hotkey badge ───────────────────────────────
+    {
+        const float headerH = 52.f;
+        const float logoSize = 36.f;   // rendered size (square)
+        const float padL = 12.f;
 
-    ImGui::SameLine(ImGui::GetWindowWidth() - 80.f);
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.353f, 0.388f, 0.478f, 0.8f));
-    ImGui::Text("[%s]", VKName(FGUI::HotkeyVK));
-    ImGui::PopStyleColor();
+        ImGui::SetCursorPos(ImVec2(padL, 3.f + (headerH - logoSize) * 0.5f));
 
+        if (FGUI::LogoTexture)
+            ImGui::Image((ImTextureID)FGUI::LogoTexture, ImVec2(logoSize, logoSize));
+        else
+        {
+            // Fallback coloured square while texture loads
+            ImGui::Dummy(ImVec2(logoSize, logoSize));
+        }
+
+        ImGui::SameLine(padL + logoSize + 8.f);
+        ImGui::SetCursorPosY(3.f + (headerH * 0.5f) - ImGui::GetTextLineHeight() * 0.5f - 3.f);
+
+        ImGui::PushStyleColor(ImGuiCol_Text, Accent());
+        ImGui::Text("ATLAS");
+        ImGui::PopStyleColor();
+        ImGui::SameLine(0.f, 6.f);
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 1.f);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.353f, 0.388f, 0.478f, 1.f));
+        ImGui::Text("| console");
+        ImGui::PopStyleColor();
+
+        // Hotkey badge – right aligned
+        char badge[32];
+        snprintf(badge, sizeof(badge), "[%s]", VKName(FGUI::HotkeyVK));
+        float badgeW = ImGui::CalcTextSize(badge).x;
+        ImGui::SameLine(ImGui::GetWindowWidth() - badgeW - 14.f);
+        ImGui::SetCursorPosY(3.f + (headerH * 0.5f) - ImGui::GetTextLineHeight() * 0.5f);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.353f, 0.388f, 0.478f, 0.8f));
+        ImGui::TextUnformatted(badge);
+        ImGui::PopStyleColor();
+
+        ImGui::SetCursorPosY(3.f + headerH);
+    }
+
+    // Divider under header
     ImGui::SetCursorPosX(0.f);
     ImGui::PushStyleColor(ImGuiCol_Separator, ImVec4(0.137f, 0.165f, 0.243f, 1.f));
     ImGui::Separator();
     ImGui::PopStyleColor();
+
+    // ── Scrollable content ────────────────────────────────────────────────────
     ImGui::SetCursorPosX(16.f);
-
     ImGui::BeginChild("##content", ImVec2(0.f, -1.f), false, ImGuiWindowFlags_NoScrollbar);
-
     ImGui::SetCursorPosX(0.f);
 
+    // ═══ EDITING ══════════════════════════════════════════════════════════════
     SectionLabel("EDITING");
 
-    ATCheckbox("Edit On Release", &FConfiguration::bEOREnabled);
-    ImGui::SameLine(0.f, 16.f);
+    ImGui::Checkbox("Edit On Release", &FConfiguration::bEOREnabled);
+    ImGui::SameLine(0.f, 10.f);
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.353f, 0.388f, 0.478f, 1.f));
     ImGui::TextUnformatted("EOR");
     ImGui::PopStyleColor();
 
-    ATCheckbox("Reset On Release", &FConfiguration::bROREnabled);
-    ImGui::SameLine(0.f, 16.f);
+    ImGui::Checkbox("Reset On Release", &FConfiguration::bROREnabled);
+    ImGui::SameLine(0.f, 10.f);
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.353f, 0.388f, 0.478f, 1.f));
     ImGui::TextUnformatted("ROR");
     ImGui::PopStyleColor();
 
-    ATCheckbox("Disable Pre-Edits", &FConfiguration::bDisablePreEdits);
+    ImGui::Checkbox("Disable Pre-Edits", &FConfiguration::bDisablePreEdits);
 
+    // ═══ RESPAWNING ═══════════════════════════════════════════════════════════
     SectionLabel("RESPAWNING");
 
-    if (ATCheckbox("Respawns Enabled", &FConfiguration::bForceRespawns))
+    ImGui::Checkbox("Respawns Enabled", &FConfiguration::bForceRespawns);
+
+    // Sub-options only visible when respawns are enabled
+    if (FConfiguration::bForceRespawns)
     {
-        // Toggling respawns live requires re-running the playlist patching logic.
-        // Call Client::Init() only for the playlist section, or set a flag that
-        // ClientThread picks up.  For simplicity we expose a thin re-apply helper:
-        // Client::ApplyRespawnSettings();   ← add this to Client.h / Client.cpp
+        ImGui::Indent(16.f);
+
+        bool RespawnTimeEnabled = (FConfiguration::RespawnTime > 0);
+        bool RespawnHeightEnabled = (FConfiguration::RespawnHeight > 0);
+
+        if (ImGui::Checkbox("Custom Respawn Time", &RespawnTimeEnabled))
+            FConfiguration::RespawnTime = RespawnTimeEnabled ? 3 : 0;
+
+        if (RespawnTimeEnabled)
+        {
+            ImGui::SameLine();
+            ImGui::PushItemWidth(80.f);
+            ImGui::SliderInt("##rtime", &FConfiguration::RespawnTime, 1, 30);
+            ImGui::PopItemWidth();
+            ImGui::SameLine();
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.353f, 0.388f, 0.478f, 1.f));
+            ImGui::Text("sec");
+            ImGui::PopStyleColor();
+        }
+
+        if (ImGui::Checkbox("Custom Respawn Height", &RespawnHeightEnabled))
+            FConfiguration::RespawnHeight = RespawnHeightEnabled ? 20000 : 0;
+
+        if (RespawnHeightEnabled)
+        {
+            ImGui::SameLine();
+            ImGui::PushItemWidth(100.f);
+            ImGui::SliderInt("##rheight", &FConfiguration::RespawnHeight, 1000, 50000);
+            ImGui::PopItemWidth();
+            ImGui::SameLine();
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.353f, 0.388f, 0.478f, 1.f));
+            ImGui::Text("uu");
+            ImGui::PopStyleColor();
+        }
+
+        ImGui::Unindent(16.f);
     }
 
-    bool RespawnTimeEnabled = (FConfiguration::RespawnTime > 0);
-    bool RespawnHeightEnabled = (FConfiguration::RespawnHeight > 0);
-
-    if (ATCheckbox("Custom Respawn Time", &RespawnTimeEnabled))
-        FConfiguration::RespawnTime = RespawnTimeEnabled ? 3 : 0;
-
-    if (RespawnTimeEnabled)
-    {
-        ImGui::SameLine();
-        ImGui::PushItemWidth(80.f);
-        ImGui::SliderInt("##rtime", &FConfiguration::RespawnTime, 1, 30);
-        ImGui::PopItemWidth();
-        ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.353f, 0.388f, 0.478f, 1.f));
-        ImGui::Text("sec");
-        ImGui::PopStyleColor();
-    }
-
-    if (ATCheckbox("Custom Respawn Height", &RespawnHeightEnabled))
-        FConfiguration::RespawnHeight = RespawnHeightEnabled ? 20000 : 0;
-
-    if (RespawnHeightEnabled)
-    {
-        ImGui::SameLine();
-        ImGui::PushItemWidth(100.f);
-        ImGui::SliderInt("##rheight", &FConfiguration::RespawnHeight, 1000, 50000);
-        ImGui::PopItemWidth();
-        ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.353f, 0.388f, 0.478f, 1.f));
-        ImGui::Text("uu");
-        ImGui::PopStyleColor();
-    }
-
+    // ═══ CONSOLE ══════════════════════════════════════════════════════════════
     SectionLabel("CONSOLE");
 
-    if (ATCheckbox("Console Enabled", &FGUI::bConsoleEnabled))
+    if (ImGui::Checkbox("Console Enabled", &FConfiguration::bConsoleEnabled))
     {
-        if (FGUI::bConsoleEnabled)
-        {
-            if (UEngine::GetEngine() && UEngine::GetEngine()->GameViewport)
-                UEngine::GetEngine()->GameViewport->ViewportConsole = UGameplayStatics::SpawnObject(UEngine::GetEngine()->ConsoleClass, UEngine::GetEngine()->GameViewport);
-        }
+        if (FConfiguration::bConsoleEnabled)
+            SpawnConsole();
+        else
+            DestroyConsole();
     }
 
-    if (ATCheckbox("Potato Graphics", &FGUI::bPotatoGraphics))
+    if (ImGui::Checkbox("Potato Graphics", &FGUI::bPotatoGraphics))
         Exec(FGUI::bPotatoGraphics ? "r.MipMapLODBias 7" : "r.MipMapLODBias 0");
 
     {
@@ -329,48 +402,39 @@ void GUI_Render()
         ImGui::PopStyleColor();
         ImGui::SameLine();
         ImGui::PushItemWidth(180.f);
-
         if (ImGui::SliderInt("##fov", &FConfiguration::FOV, 0, 175))
         {
             char cmd[32];
             snprintf(cmd, sizeof(cmd), "fov %d", FConfiguration::FOV);
             Exec(cmd);
         }
-
         ImGui::PopItemWidth();
         ImGui::SameLine();
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.353f, 0.388f, 0.478f, 1.f));
-        ImGui::Text("%d°", FConfiguration::FOV);
+        ImGui::Text("%d\xc2\xb0", FConfiguration::FOV);
         ImGui::PopStyleColor();
     }
 
     {
         const char* resItems[] = { "1920x1080", "1720x1080", "1280x720" };
         const char* resCmds[] = { "setres 1920x1080", "setres 1720x1080", "setres 1280x720" };
-
         ImGui::Text("Resolution");
         ImGui::SameLine();
         ImGui::PushItemWidth(140.f);
-
         if (ImGui::BeginCombo("##res", resItems[FGUI::Resolution]))
         {
             for (int i = 0; i < 3; i++)
             {
-                bool selected = (FGUI::Resolution == i);
-
-                if (ImGui::Selectable(resItems[i], selected))
+                bool sel = (FGUI::Resolution == i);
+                if (ImGui::Selectable(resItems[i], sel))
                 {
                     FGUI::Resolution = i;
                     Exec(resCmds[i]);
                 }
-
-                if (selected) 
-                    ImGui::SetItemDefaultFocus();
+                if (sel) ImGui::SetItemDefaultFocus();
             }
-
             ImGui::EndCombo();
         }
-
         ImGui::PopItemWidth();
     }
 
@@ -378,8 +442,8 @@ void GUI_Render()
 
     if (FGUI::bRebinding)
     {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.239f, 0.96f, 0.784f, 1.f));
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.239f, 0.96f, 0.784f, 0.18f));
+        ImGui::PushStyleColor(ImGuiCol_Text, Accent());
+        ImGui::PushStyleColor(ImGuiCol_Button, Accent(0.18f));
         ImGui::Button("Press any key...", ImVec2(-1.f, 0.f));
         ImGui::PopStyleColor(2);
     }
@@ -387,7 +451,6 @@ void GUI_Render()
     {
         char btnLabel[64];
         snprintf(btnLabel, sizeof(btnLabel), "Rebind GUI Key  [%s]", VKName(FGUI::HotkeyVK));
-
         if (ImGui::Button(btnLabel, ImVec2(-1.f, 0.f)))
             FGUI::bRebinding = true;
     }

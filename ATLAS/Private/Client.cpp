@@ -29,6 +29,7 @@ void* SelectReset(void* a1)
 
 	return result;
 }
+
 void PerformBuildingEditInteraction(AFortPlayerControllerAthena* _this)
 {
 	if (FConfiguration::bDisablePreEdits && _this->TargetedBuilding->IsA<ABuildingPlayerPrimitivePreview>())
@@ -85,7 +86,8 @@ void ClientThread()
 
 void Client::Init()
 {
-	UEngine::GetEngine()->GameViewport->ViewportConsole = UGameplayStatics::SpawnObject(UEngine::GetEngine()->ConsoleClass, UEngine::GetEngine()->GameViewport);
+	if (FConfiguration::bConsoleEnabled)
+		UEngine::GetEngine()->GameViewport->ViewportConsole = UGameplayStatics::SpawnObject(UEngine::GetEngine()->ConsoleClass, UEngine::GetEngine()->GameViewport);
 
 	if (VersionInfo.FortniteVersion >= 10 || FConfiguration::bForceRespawns)
 	{

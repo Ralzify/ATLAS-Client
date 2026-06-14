@@ -23,14 +23,21 @@ static Present_t OriginalPresent = nullptr;
 static WNDPROC OriginalWndProc = nullptr;
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 
+static bool g_WasVisible = false;
+
 static LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     if (g_ImGuiReady && FGUI::bVisible)
     {
         ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam);
 
-        // Block mouse clicks / keyboard from reaching the game while GUI is open
-        if (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP || msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP || msg == WM_MBUTTONDOWN || msg == WM_MBUTTONUP || msg == WM_MOUSEWHEEL || msg == WM_MOUSEMOVE || msg == WM_KEYDOWN || msg == WM_KEYUP || msg == WM_CHAR || msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP)
+        if (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP ||
+            msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP ||
+            msg == WM_MBUTTONDOWN || msg == WM_MBUTTONUP ||
+            msg == WM_MOUSEWHEEL || msg == WM_MOUSEMOVE ||
+            msg == WM_KEYDOWN || msg == WM_KEYUP ||
+            msg == WM_CHAR || msg == WM_SYSKEYDOWN ||
+            msg == WM_SYSKEYUP)
         {
             return 0;
         }
@@ -51,8 +58,8 @@ static HRESULT __stdcall HookedPresent(IDXGISwapChain* pSwapChain, UINT SyncInte
             g_hWnd = sd.OutputWindow;
 
             ID3D11Texture2D* pBackBuffer = nullptr;
-            pSwapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&pBackBuffer);
 
+            pSwapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&pBackBuffer);
             if (pBackBuffer)
             {
                 g_pd3dDevice->CreateRenderTargetView(pBackBuffer, nullptr, &g_mainRTV);
@@ -71,6 +78,7 @@ static HRESULT __stdcall HookedPresent(IDXGISwapChain* pSwapChain, UINT SyncInte
             ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dContext);
 
             GUI_Init();
+            GUI_LoadTextures(g_pd3dDevice);
 
             g_ImGuiReady = true;
         }
@@ -78,6 +86,25 @@ static HRESULT __stdcall HookedPresent(IDXGISwapChain* pSwapChain, UINT SyncInte
 
     if (g_ImGuiReady)
     {
+        GUI_HandleInput();
+
+        if (FGUI::bVisible != g_WasVisible)
+        {
+            if (FGUI::bVisible)
+            {
+                ClipCursor(nullptr);
+                ReleaseCapture();
+                ShowCursor(TRUE);
+            }
+            else
+            {
+                ShowCursor(FALSE);
+                SetForegroundWindow(g_hWnd);
+            }
+
+            g_WasVisible = FGUI::bVisible;
+        }
+
         ImGuiIO& io = ImGui::GetIO();
         io.MouseDrawCursor = FGUI::bVisible;
 
@@ -122,7 +149,7 @@ static Present_t GetPresentAddress()
 
     HRESULT hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, &featureLevel, 1, D3D11_SDK_VERSION, &scd, &tmpChain, &tmpDevice, nullptr, &tmpContext);
 
-    if (FAILED(hr))
+    if (FAILED(hr)) 
         return nullptr;
 
     void** vtable = *reinterpret_cast<void***>(tmpChain);
@@ -149,63 +176,51 @@ static void InstallDXHook()
 
 void ForceIris(uintptr_t IrisBool)
 {
-	Memcury::PE::Address add{ nullptr };
-
-	const auto sizeOfImage = Memcury::PE::GetNTHeaders()->OptionalHeader.SizeOfImage;
-	const auto scanBytes = reinterpret_cast<std::uint8_t*>(Memcury::PE::GetModuleBase());
-
-	for (auto i = 0ul; i < sizeOfImage - 5; ++i)
-	{
-		if (scanBytes[i] == 0x83 || scanBytes[i] == 0x39)
-		{
-			if (Memcury::PE::Address(&scanBytes[i]).RelativeOffset(2, scanBytes[i] == 0x83).GetAs<void*>() == (void*)IrisBool)
-			{
-				add = Memcury::PE::Address(&scanBytes[i]);
-
-                Utils::Patch<uint32_t>(__int64(&scanBytes[i]) + 2, 0x0); // the next bytes will always be greater than 0
-			}
-		}
-	}
+    const auto sizeOfImage = Memcury::PE::GetNTHeaders()->OptionalHeader.SizeOfImage;
+    const auto scanBytes = reinterpret_cast<std::uint8_t*>(Memcury::PE::GetModuleBase());
+    for (auto i = 0ul; i < sizeOfImage - 5; ++i)
+    {
+        if (scanBytes[i] == 0x83 || scanBytes[i] == 0x39)
+        {
+            if (Memcury::PE::Address(&scanBytes[i]).RelativeOffset(2, scanBytes[i] == 0x83).GetAs<void*>() == (void*)IrisBool)
+                Utils::Patch<uint32_t>(__int64(&scanBytes[i]) + 2, 0x0);
+        }
+    }
 }
 
 void Main()
 {
+    InstallDXHook();
+
     SDK::Init();
 
     if (VersionInfo.EngineVersion >= 5.0)
     {
         auto RuntimeOptions = DefaultObjImpl("FortRuntimeOptions");
-
         if (RuntimeOptions)
         {
-            auto bWaitForServerToBeInitializedBeforeTravelingFeatureEnabledOffset = RuntimeOptions->GetOffset("bWaitForServerToBeInitializedBeforeTravelingFeatureEnabled");
-
-            if (bWaitForServerToBeInitializedBeforeTravelingFeatureEnabledOffset != -1)
-                *(bool*)(__int64(RuntimeOptions) + bWaitForServerToBeInitializedBeforeTravelingFeatureEnabledOffset) = false;
+            auto offset = RuntimeOptions->GetOffset("bWaitForServerToBeInitializedBeforeTravelingFeatureEnabled");
+            if (offset != -1)
+                *(bool*)(__int64(RuntimeOptions) + offset) = false;
         }
         UKismetSystemLibrary::ExecuteConsoleCommand(UWorld::GetWorld(), FString(L"log LogFortUIDirector None"), nullptr);
     }
     if (VersionInfo.EngineVersion >= 5.1)
-    {
         UKismetSystemLibrary::ExecuteConsoleCommand(UWorld::GetWorld(), FString(L"net.AllowEncryption 0"), nullptr);
-    }
+
     if (VersionInfo.EngineVersion >= 5.3 && FConfiguration::bEnableIris)
     {
         UKismetSystemLibrary::ExecuteConsoleCommand(UWorld::GetWorld(), FString(L"log LogIris None"), nullptr);
         UKismetSystemLibrary::ExecuteConsoleCommand(UWorld::GetWorld(), FString(L"log LogIrisRpc None"), nullptr);
         UKismetSystemLibrary::ExecuteConsoleCommand(UWorld::GetWorld(), FString(L"log LogIrisBridge None"), nullptr);
         auto IrisBool = Memcury::Scanner::FindPattern("83 3D ? ? ? ? ? 0F 8E ? ? ? ? 49 8B B9").RelativeOffset(2, 1).Get();
-        if (IrisBool)
-            *(uint32_t*)IrisBool = true;
+        if (IrisBool) *(uint32_t*)IrisBool = true;
         else
         {
             IrisBool = Memcury::Scanner::FindPattern("44 39 25 ? ? ? ? 0F 9F C0 45 84 FF").RelativeOffset(3).Get();
-
-            if (IrisBool)
-                *(uint32_t*)IrisBool = true;
+            if (IrisBool) *(uint32_t*)IrisBool = true;
         }
         ForceIris(IrisBool);
-        //UKismetSystemLibrary::ExecuteConsoleCommand(UWorld::GetWorld(), FString(L"net.Iris.UseIrisReplication 1"), nullptr);
     }
     if (VersionInfo.EngineVersion >= 5.4)
     {
@@ -216,8 +231,6 @@ void Main()
     }
 
     Client::Init();
-
-    return;
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved)

@@ -628,6 +628,7 @@ namespace SDK
 		DEFINE_STATIC_FUNC(FinishSpawningActor, AActor*);
 		DEFINE_STATIC_FUNC(GetAllActorsOfClass, TArray<AActor*>);
 		DEFINE_STATIC_FUNC(RemovePlayer, void);
+
 		static double GetTimeSeconds(UObject* WorldContextObject)
 		{
 			static UFunction* GetTimeSeconds__Ptr = nullptr;
