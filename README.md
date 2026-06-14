@@ -52,7 +52,7 @@ ATLAS Console is a lightweight in-game overlay and client mod for OGFN private s
 
 
 
-\### Console
+### Console
 
 
 
@@ -100,9 +100,9 @@ ATLAS/
 
 |   +-- Configuration.h    Static configuration flags and values (FOV, respawn settings, etc.)
 
-|   +-- GUI.h              FGUI state struct, GUI\_Init / GUI\_Render / GUI\_HandleInput declarations
+|   +-- GUI.h              FGUI state struct, GUI_Init / GUI_Render / GUI_HandleInput declarations
 
-|   +-- GUI\_Hotkey.h       Lightweight hotkey persistence (read/write %APPDATA%\\ATLAS\\settings.json)
+|   +-- GUI_Hotkey.h       Lightweight hotkey persistence (read/write %APPDATA%\\ATLAS\\settings.json)
 
 |   +-- Utils.h            Hook helpers, memory patching utilities
 
@@ -116,9 +116,9 @@ ATLAS/
 
 |   +-- imgui.h / imgui.cpp
 
-|   +-- imgui\_impl\_dx11.h / imgui\_impl\_dx11.cpp
+|   +-- imgui_impl_dx11.h / imgui_impl_dx11.cpp
 
-|   +-- imgui\_impl\_win32.h / imgui\_impl\_win32.cpp
+|   +-- imgui_impl_win32.h / imgui_impl_win32.cpp
 
 +-- SDK/
 
