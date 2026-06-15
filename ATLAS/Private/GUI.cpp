@@ -44,9 +44,10 @@ void FGUI::LoadHotkey() { FGUI::HotkeyVK = HotkeyPersist::Load(VK_F9); }
 void GUI_LoadTextures(ID3D11Device* device)
 {
     int w, h, ch;
-    unsigned char* pixels = stbi_load_from_memory(
-        g_AtlasLogoPNG, (int)g_AtlasLogoSize, &w, &h, &ch, 4);
-    if (!pixels) return;
+    unsigned char* pixels = stbi_load_from_memory(Icon, (int)sizeof(Icon), &w, &h, &ch, 4);
+
+    if (!pixels) 
+        return;
 
     D3D11_TEXTURE2D_DESC desc{};
     desc.Width = (UINT)w;
@@ -94,7 +95,7 @@ static void PushStyle()
     s.ItemSpacing = { 8.f,  7.f };
     s.ItemInnerSpacing = { 6.f,  4.f };
     s.IndentSpacing = 18.f;
-    s.ScrollbarSize = 10.f;
+    s.ScrollbarSize = 4.f;
     s.GrabMinSize = 10.f;
     s.WindowBorderSize = 1.f;
     s.FrameBorderSize = 0.f;
@@ -198,14 +199,11 @@ static void DestroyConsole()
 {
     auto Engine = UEngine::GetEngine();
 
-    if (Engine && Engine->GameViewport && Engine->GameViewport->ViewportConsole)
-    {
-        if (auto Console = Engine->GameViewport->ViewportConsole->Cast<AActor>())
-        {
-            Console->K2_DestroyActor();
-            Engine->GameViewport->ViewportConsole = nullptr;
-        }
-    }
+    if (!Engine || !Engine->GameViewport || !Engine->GameViewport->ViewportConsole)
+        return;
+
+    Engine->GameViewport->ViewportConsole->ObjectFlags |= 0x4; // RF_BeginDestroyed — marks it for GC
+    Engine->GameViewport->ViewportConsole = nullptr;
 }
 
 void GUI_Init()
@@ -262,15 +260,14 @@ void GUI_Render()
         ImDrawList* dl = ImGui::GetWindowDrawList();
         ImVec2 wp = ImGui::GetWindowPos();
         ImVec2 ws = ImGui::GetWindowSize();
-        dl->AddRectFilled(wp, ImVec2(wp.x + ws.x, wp.y + 3.f), IM_COL32(0, 162, 206, 255));
+        //dl->AddRectFilled(wp, ImVec2(wp.x + ws.x, wp.y + 2.f), IM_COL32(11, 13, 18, 255)); // delete??
     }
 
     ImGui::SetCursorPosY(3.f);
 
-    // ── Header row: logo + title + hotkey badge ───────────────────────────────
     {
         const float headerH = 52.f;
-        const float logoSize = 36.f;   // rendered size (square)
+        const float logoSize = 40.f;
         const float padL = 12.f;
 
         ImGui::SetCursorPos(ImVec2(padL, 3.f + (headerH - logoSize) * 0.5f));
@@ -278,24 +275,21 @@ void GUI_Render()
         if (FGUI::LogoTexture)
             ImGui::Image((ImTextureID)FGUI::LogoTexture, ImVec2(logoSize, logoSize));
         else
-        {
-            // Fallback coloured square while texture loads
             ImGui::Dummy(ImVec2(logoSize, logoSize));
-        }
 
         ImGui::SameLine(padL + logoSize + 8.f);
-        ImGui::SetCursorPosY(3.f + (headerH * 0.5f) - ImGui::GetTextLineHeight() * 0.5f - 3.f);
+        const float titleY = 3.f + (headerH * 0.5f) - ImGui::GetTextLineHeight() * 0.5f;
+        ImGui::SetCursorPosY(titleY);
 
         ImGui::PushStyleColor(ImGuiCol_Text, Accent());
         ImGui::Text("ATLAS");
         ImGui::PopStyleColor();
         ImGui::SameLine(0.f, 6.f);
-        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 1.f);
+        ImGui::SetCursorPosY(titleY);
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.353f, 0.388f, 0.478f, 1.f));
         ImGui::Text("| console");
         ImGui::PopStyleColor();
 
-        // Hotkey badge – right aligned
         char badge[32];
         snprintf(badge, sizeof(badge), "[%s]", VKName(FGUI::HotkeyVK));
         float badgeW = ImGui::CalcTextSize(badge).x;
@@ -308,18 +302,15 @@ void GUI_Render()
         ImGui::SetCursorPosY(3.f + headerH);
     }
 
-    // Divider under header
     ImGui::SetCursorPosX(0.f);
     ImGui::PushStyleColor(ImGuiCol_Separator, ImVec4(0.137f, 0.165f, 0.243f, 1.f));
     ImGui::Separator();
     ImGui::PopStyleColor();
 
-    // ── Scrollable content ────────────────────────────────────────────────────
-    ImGui::SetCursorPosX(16.f);
     ImGui::BeginChild("##content", ImVec2(0.f, -1.f), false, ImGuiWindowFlags_NoScrollbar);
-    ImGui::SetCursorPosX(0.f);
+    ImGui::SetCursorPosX(14.f);
+    ImGui::BeginGroup();
 
-    // ═══ EDITING ══════════════════════════════════════════════════════════════
     SectionLabel("EDITING");
 
     ImGui::Checkbox("Edit On Release", &FConfiguration::bEOREnabled);
@@ -336,15 +327,13 @@ void GUI_Render()
 
     ImGui::Checkbox("Disable Pre-Edits", &FConfiguration::bDisablePreEdits);
 
-    // ═══ RESPAWNING ═══════════════════════════════════════════════════════════
     SectionLabel("RESPAWNING");
 
     ImGui::Checkbox("Respawns Enabled", &FConfiguration::bForceRespawns);
 
-    // Sub-options only visible when respawns are enabled
     if (FConfiguration::bForceRespawns)
     {
-        ImGui::Indent(16.f);
+        //ImGui::Indent(16.f);
 
         bool RespawnTimeEnabled = (FConfiguration::RespawnTime > 0);
         bool RespawnHeightEnabled = (FConfiguration::RespawnHeight > 0);
@@ -379,10 +368,9 @@ void GUI_Render()
             ImGui::PopStyleColor();
         }
 
-        ImGui::Unindent(16.f);
+        //ImGui::Unindent(16.f);
     }
 
-    // ═══ CONSOLE ══════════════════════════════════════════════════════════════
     SectionLabel("CONSOLE");
 
     if (ImGui::Checkbox("Console Enabled", &FConfiguration::bConsoleEnabled))
@@ -394,8 +382,14 @@ void GUI_Render()
     }
 
     if (ImGui::Checkbox("Potato Graphics", &FGUI::bPotatoGraphics))
-        Exec(FGUI::bPotatoGraphics ? "r.MipMapLODBias 7" : "r.MipMapLODBias 0");
+    {
+        auto World = UWorld::GetWorld();
 
+        if (World)
+            UKismetSystemLibrary::ExecuteConsoleCommand(World, FString(FGUI::bPotatoGraphics ? L"r.MipMapLODBias 7" : L"r.MipMapLODBias 0"), nullptr);
+    }
+
+    // fov
     {
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.847f, 0.878f, 0.941f, 1.f));
         ImGui::Text("FOV");
@@ -415,7 +409,7 @@ void GUI_Render()
         ImGui::PopStyleColor();
     }
 
-    {
+    /* {
         const char* resItems[] = { "1920x1080", "1720x1080", "1280x720" };
         const char* resCmds[] = { "setres 1920x1080", "setres 1720x1080", "setres 1280x720" };
         ImGui::Text("Resolution");
@@ -436,7 +430,7 @@ void GUI_Render()
             ImGui::EndCombo();
         }
         ImGui::PopItemWidth();
-    }
+    } */
 
     SectionLabel("HOTKEYS");
 
@@ -444,14 +438,14 @@ void GUI_Render()
     {
         ImGui::PushStyleColor(ImGuiCol_Text, Accent());
         ImGui::PushStyleColor(ImGuiCol_Button, Accent(0.18f));
-        ImGui::Button("Press any key...", ImVec2(-1.f, 0.f));
+        ImGui::Button("Press any key...", ImVec2(370.f, 0.f));
         ImGui::PopStyleColor(2);
     }
     else
     {
         char btnLabel[64];
         snprintf(btnLabel, sizeof(btnLabel), "Rebind GUI Key  [%s]", VKName(FGUI::HotkeyVK));
-        if (ImGui::Button(btnLabel, ImVec2(-1.f, 0.f)))
+        if (ImGui::Button(btnLabel, ImVec2(370.f, 0.f)))
             FGUI::bRebinding = true;
     }
 
@@ -460,6 +454,8 @@ void GUI_Render()
     ImGui::TextWrapped("Hotkey is saved automatically and will persist across sessions.");
     ImGui::PopStyleColor();
 
+    ImGui::Dummy(ImVec2(0.f, 8.f));
+    ImGui::EndGroup();
     ImGui::EndChild();
     ImGui::End();
 }

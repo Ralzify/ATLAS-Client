@@ -5,7 +5,7 @@
 struct FConfiguration
 {
 	static inline bool bConsoleEnabled = true;
-	static inline bool bForceRespawns = false;
+	static inline bool bForceRespawns = true;
 	static inline bool bEnableIris = false;
 	static inline bool bEOREnabled = false;
 	static inline bool bROREnabled = false;

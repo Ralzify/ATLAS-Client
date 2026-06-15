@@ -40,9 +40,9 @@
     <ClInclude Include="ATLAS\Public\FortPlaylistAthena.h" />
     <ClInclude Include="ATLAS\Public\GUI.h" />
     <ClInclude Include="ATLAS\Public\Hotkey.h" />
+    <ClInclude Include="ATLAS\Public\Icon.h" />
     <ClInclude Include="ATLAS\Public\MinHook.h" />
     <ClInclude Include="ATLAS\Public\Utils.h" />
-    <ClInclude Include="Icon.h" />
     <ClInclude Include="pch.h" />
     <ClInclude Include="SDK\Containers.h" />
     <ClInclude Include="SDK\Core.h" />

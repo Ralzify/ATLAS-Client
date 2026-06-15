@@ -108,11 +108,11 @@
     <ClInclude Include="ATLAS\Public\GUI.h">
       <Filter>ATLAS\Public</Filter>
     </ClInclude>
-    <ClInclude Include="Icon.h">
-      <Filter>ATLAS\Public</Filter>
-    </ClInclude>
     <ClInclude Include="ATLAS\ImGui\stb_image.h">
       <Filter>ATLAS\ImGui</Filter>
+    </ClInclude>
+    <ClInclude Include="ATLAS\Public\Icon.h">
+      <Filter>ATLAS\Public</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
