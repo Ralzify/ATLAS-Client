@@ -241,7 +241,7 @@ ATLAS Console targets multiple Fortnite builds and engine versions. Version-spec
 
 ## Credits
 
-
+- [Plooshi](https://github.com/plooshi) - [ErbiumClient](https://github.com/plooshi/Erbium/tree/main/ErbiumClient), the core/base of the console.
 
 - [TsudaKageyu](https://github.com/TsudaKageyu) — [MinHook](https://github.com/TsudaKageyu/minhook), used for function hooking.
 
