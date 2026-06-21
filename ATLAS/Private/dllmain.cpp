@@ -31,6 +31,14 @@ static LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
     {
         ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam);
 
+        if (msg == WM_INPUT)
+        {
+            BYTE rawBuffer[256];
+            UINT rawSize = sizeof(rawBuffer);
+            GetRawInputData((HRAWINPUT)lParam, RID_INPUT, rawBuffer, &rawSize, sizeof(RAWINPUTHEADER));
+            return 0;
+        }
+
         if (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP ||
             msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP ||
             msg == WM_MBUTTONDOWN || msg == WM_MBUTTONUP ||

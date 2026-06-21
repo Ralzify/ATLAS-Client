@@ -41,6 +41,9 @@ static const char* VKName(int vk)
 void FGUI::SaveHotkey() { HotkeyPersist::Save(FGUI::HotkeyVK); }
 void FGUI::LoadHotkey() { FGUI::HotkeyVK = HotkeyPersist::Load(VK_F9); }
 
+void FGUI::SaveJoinHotkey() { HotkeyPersist::Save(FGUI::JoinHotkeyVK, "joinHotkey"); }
+void FGUI::LoadJoinHotkey() { FGUI::JoinHotkeyVK = HotkeyPersist::Load(VK_F5, "joinHotkey"); }
+
 void GUI_LoadTextures(ID3D11Device* device)
 {
     int w, h, ch;
@@ -168,11 +171,6 @@ static void SectionLabel(const char* label)
     ImGui::Spacing();
 }
 
-static bool ATCheckbox(const char* label, bool* v)
-{
-    return ImGui::Checkbox(label, v);
-}
-
 static void Exec(const char* cmd)
 {
     if (!UWorld::GetWorld() || !UWorld::GetWorld()->OwningGameInstance) return;
@@ -185,6 +183,17 @@ static void Exec(const char* cmd)
     std::wstring ws(len - 1, L'\0');
     MultiByteToWideChar(CP_UTF8, 0, cmd, -1, ws.data(), len);
     UKismetSystemLibrary::ExecuteConsoleCommand(pc, FString(ws.c_str()));
+}
+
+static void ExecEngine(const char* cmd)
+{
+    auto World = UWorld::GetWorld();
+    if (!World) return;
+
+    int len = MultiByteToWideChar(CP_UTF8, 0, cmd, -1, nullptr, 0);
+    std::wstring ws(len - 1, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, cmd, -1, ws.data(), len);
+    UKismetSystemLibrary::ExecuteConsoleCommand(World, FString(ws.c_str()), nullptr);
 }
 
 static void SpawnConsole()
@@ -206,6 +215,23 @@ static void DestroyConsole()
     Engine->GameViewport->ViewportConsole = nullptr;
 }
 
+static void JoinSelectedHost()
+{
+    if (FGUI::HostType == 0)
+    {
+        Exec("open 127.0.0.1");
+    }
+    else
+    {
+        if (FGUI::RemoteIP[0] == '\0')
+            return;
+
+        std::string cmd = "open ";
+        cmd += FGUI::RemoteIP;
+        Exec(cmd.c_str());
+    }
+}
+
 void GUI_Init()
 {
     FGUI::LoadHotkey();
@@ -214,14 +240,14 @@ void GUI_Init()
 
 void GUI_HandleInput()
 {
+    static const int candidates[] = {
+        VK_F1, VK_F2, VK_F3, VK_F4, VK_F5,  VK_F6,
+        VK_F7, VK_F8, VK_F9, VK_F10, VK_F11, VK_F12,
+        VK_INSERT, VK_DELETE, VK_HOME, VK_END, VK_PRIOR, VK_NEXT
+    };
+
     if (FGUI::bRebinding)
     {
-        static const int candidates[] = {
-            VK_F1, VK_F2, VK_F3, VK_F4, VK_F5,  VK_F6,
-            VK_F7, VK_F8, VK_F9, VK_F10, VK_F11, VK_F12,
-            VK_INSERT, VK_DELETE, VK_HOME, VK_END, VK_PRIOR, VK_NEXT
-        };
-
         for (int vk : candidates)
         {
             if (GetAsyncKeyState(vk) & 1)
@@ -236,8 +262,27 @@ void GUI_HandleInput()
         return;
     }
 
+    if (FGUI::bRebindingJoin)
+    {
+        for (int vk : candidates)
+        {
+            if (GetAsyncKeyState(vk) & 1)
+            {
+                FGUI::JoinHotkeyVK = vk;
+                FGUI::bRebindingJoin = false;
+                FGUI::SaveJoinHotkey();
+                break;
+            }
+        }
+
+        return;
+    }
+
     if (GetAsyncKeyState(FGUI::HotkeyVK) & 1)
         FGUI::bVisible = !FGUI::bVisible;
+
+    if (GetAsyncKeyState(FGUI::JoinHotkeyVK) & 1)
+        JoinSelectedHost();
 }
 
 void GUI_Render()
@@ -311,21 +356,64 @@ void GUI_Render()
     ImGui::SetCursorPosX(14.f);
     ImGui::BeginGroup();
 
-    SectionLabel("EDITING");
+    SectionLabel("HOST TYPE");
 
-    ImGui::Checkbox("Edit On Release", &FConfiguration::bEOREnabled);
-    ImGui::SameLine(0.f, 10.f);
+    const char* hostTypeItems[] = { "Local Host", "Remote Host" };
+    ImGui::PushItemWidth(370.f);
+    ImGui::Combo("##hosttype", &FGUI::HostType, hostTypeItems, 2);
+    ImGui::PopItemWidth();
+
+    ImGui::Spacing();
+
+    if (FGUI::HostType == 0)
+    {
+        if (ImGui::Button("Join Local Host", ImVec2(370.f, 0.f)))
+            JoinSelectedHost();
+    }
+    else
+    {
+        ImGui::PushItemWidth(370.f);
+        ImGui::InputTextWithHint("##remoteip", "Enter IP to join", FGUI::RemoteIP, sizeof(FGUI::RemoteIP));
+        ImGui::PopItemWidth();
+
+        ImGui::Spacing();
+
+        if (ImGui::Button("Join Remote Host", ImVec2(370.f, 0.f)))
+            JoinSelectedHost();
+    }
+
+    ImGui::Spacing();
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.353f, 0.388f, 0.478f, 1.f));
-    ImGui::TextUnformatted("EOR");
+    ImGui::TextWrapped("Pressing this key joins the currently selected host type.");
     ImGui::PopStyleColor();
 
-    ImGui::Checkbox("Reset On Release", &FConfiguration::bROREnabled);
-    ImGui::SameLine(0.f, 10.f);
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.353f, 0.388f, 0.478f, 1.f));
-    ImGui::TextUnformatted("ROR");
-    ImGui::PopStyleColor();
+    if (VersionInfo.FortniteVersion < 24.30)
+    {
+        SectionLabel("EDITING");
 
-    ImGui::Checkbox("Disable Pre-Edits", &FConfiguration::bDisablePreEdits);
+        if (VersionInfo.EngineVersion < 4.24)
+        {
+            ImGui::Checkbox("Edit On Release", &FConfiguration::bEOREnabled);
+            ImGui::SameLine(0.f, 10.f);
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.353f, 0.388f, 0.478f, 1.f));
+            ImGui::TextUnformatted("EOR");
+            ImGui::PopStyleColor();
+        }
+
+        if (VersionInfo.FortniteVersion < 24.30)
+        {
+            ImGui::Checkbox("Reset On Release", &FConfiguration::bROREnabled);
+            ImGui::SameLine(0.f, 10.f);
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.353f, 0.388f, 0.478f, 1.f));
+            ImGui::TextUnformatted("ROR");
+            ImGui::PopStyleColor();
+        }
+
+        if (VersionInfo.FortniteVersion < 15.20)
+        {
+            ImGui::Checkbox("Disable Pre-Edits", &FConfiguration::bDisablePreEdits);
+        }
+    }
 
     SectionLabel("RESPAWNING");
 
@@ -381,13 +469,8 @@ void GUI_Render()
             DestroyConsole();
     }
 
-    if (ImGui::Checkbox("Potato Graphics", &FGUI::bPotatoGraphics))
-    {
-        auto World = UWorld::GetWorld();
-
-        if (World)
-            UKismetSystemLibrary::ExecuteConsoleCommand(World, FString(FGUI::bPotatoGraphics ? L"r.MipMapLODBias 7" : L"r.MipMapLODBias 0"), nullptr);
-    }
+    if (ImGui::Checkbox("Potato Graphics", &FConfiguration::bPotatoGraphics))
+		ExecEngine(FConfiguration::bPotatoGraphics ? "r.MipMapLODBias 7" : "r.MipMapLODBias 0"); // for some odd reason this always sets r.MipMapLODBias to 0 and i dont know why
 
     // fov
     {
@@ -396,17 +479,25 @@ void GUI_Render()
         ImGui::PopStyleColor();
         ImGui::SameLine();
         ImGui::PushItemWidth(180.f);
-        if (ImGui::SliderInt("##fov", &FConfiguration::FOV, 0, 175))
+
+        if (ImGui::SliderInt("##fov", &FConfiguration::FOV, 1, 175))
         {
             char cmd[32];
             snprintf(cmd, sizeof(cmd), "fov %d", FConfiguration::FOV);
             Exec(cmd);
         }
+
         ImGui::PopItemWidth();
         ImGui::SameLine();
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.353f, 0.388f, 0.478f, 1.f));
         ImGui::Text("%d\xc2\xb0", FConfiguration::FOV);
         ImGui::PopStyleColor();
+    }
+
+	if (ImGui::Button("Reset FOV", ImVec2(100.f, 0.f)))
+    {
+        FConfiguration::FOV = 80;
+        Exec("fov");
     }
 
     /* {
@@ -447,6 +538,21 @@ void GUI_Render()
         snprintf(btnLabel, sizeof(btnLabel), "Rebind GUI Key  [%s]", VKName(FGUI::HotkeyVK));
         if (ImGui::Button(btnLabel, ImVec2(370.f, 0.f)))
             FGUI::bRebinding = true;
+    }
+
+    if (FGUI::bRebindingJoin)
+    {
+        ImGui::PushStyleColor(ImGuiCol_Text, Accent());
+        ImGui::PushStyleColor(ImGuiCol_Button, Accent(0.18f));
+        ImGui::Button("Press any key...", ImVec2(370.f, 0.f));
+        ImGui::PopStyleColor(2);
+    }
+    else
+    {
+        char joinBtnLabel[64];
+        snprintf(joinBtnLabel, sizeof(joinBtnLabel), "Rebind Join Key  [%s]", VKName(FGUI::JoinHotkeyVK));
+        if (ImGui::Button(joinBtnLabel, ImVec2(370.f, 0.f)))
+            FGUI::bRebindingJoin = true;
     }
 
     ImGui::Spacing();
