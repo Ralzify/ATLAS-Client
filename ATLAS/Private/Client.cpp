@@ -60,6 +60,7 @@ void ClientThread()
 			}
 		}
 
+		/*
 		if (!bPressed && GetAsyncKeyState(VK_F3))
 		{
 			bPressed = true;
@@ -72,13 +73,16 @@ void ClientThread()
 
 			FConfiguration::bDisablePreEdits ^= 1;
 		}
-		/*else if (!bPressed && GetAsyncKeyState(VK_F2))
+		else if (!bPressed && GetAsyncKeyState(VK_F2))
 		{
 			bPressed = true;
 			//bEnableResetOnRelease ^= 1;
-		}*/
+		}
 		else if (!GetAsyncKeyState(VK_F3) && !GetAsyncKeyState(VK_F4))
 			bPressed = false;
+		*/
+
+		// todo: add custom keybinds for stuff like tp to waypoint
 
 		Sleep(33); // thread runs at 30tps	
 	}

@@ -313,41 +313,56 @@ void GUI_Render()
 
     ImGui::SetCursorPosY(3.f);
 
+    // title bar
     {
-        const float headerH = 52.f;
-        const float logoSize = 40.f;
-        const float padL = 12.f;
+        const float HeaderH = 52.f;
+        const float LogoSize = 40.f;
+        const float PadL = 12.f;
 
-        ImGui::SetCursorPos(ImVec2(padL, 3.f + (headerH - logoSize) * 0.5f));
+        ImGui::SetCursorPos(ImVec2(PadL, 3.f + (HeaderH - LogoSize) * 0.5f));
 
         if (FGUI::LogoTexture)
-            ImGui::Image((ImTextureID)FGUI::LogoTexture, ImVec2(logoSize, logoSize));
+            ImGui::Image((ImTextureID)FGUI::LogoTexture, ImVec2(LogoSize, LogoSize));
         else
-            ImGui::Dummy(ImVec2(logoSize, logoSize));
+            ImGui::Dummy(ImVec2(LogoSize, LogoSize));
 
-        ImGui::SameLine(padL + logoSize + 8.f);
-        const float titleY = 3.f + (headerH * 0.5f) - ImGui::GetTextLineHeight() * 0.5f;
-        ImGui::SetCursorPosY(titleY);
+        ImGui::SameLine(PadL + LogoSize + 8.f);
+        const float TitleY = 3.f + (HeaderH * 0.5f) - ImGui::GetTextLineHeight() * 0.5f;
+        ImGui::SetCursorPosY(TitleY);
 
         ImGui::PushStyleColor(ImGuiCol_Text, Accent());
         ImGui::Text("ATLAS");
         ImGui::PopStyleColor();
         ImGui::SameLine(0.f, 6.f);
-        ImGui::SetCursorPosY(titleY);
+        ImGui::SetCursorPosY(TitleY);
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.353f, 0.388f, 0.478f, 1.f));
         ImGui::Text("| console");
         ImGui::PopStyleColor();
 
-        char badge[32];
-        snprintf(badge, sizeof(badge), "[%s]", VKName(FGUI::HotkeyVK));
-        float badgeW = ImGui::CalcTextSize(badge).x;
-        ImGui::SameLine(ImGui::GetWindowWidth() - badgeW - 14.f);
-        ImGui::SetCursorPosY(3.f + (headerH * 0.5f) - ImGui::GetTextLineHeight() * 0.5f);
+        char Badge[32];
+        snprintf(Badge, sizeof(Badge), "[%s]", VKName(FGUI::HotkeyVK));
+        float BadgeW = ImGui::CalcTextSize(Badge).x;
+        float BadgeH = ImGui::GetTextLineHeight();
+
+        float VersionW = ImGui::CalcTextSize(FConfiguration::ConsoleVersion).x;
+        float VersionH = ImGui::GetTextLineHeight();
+
+        float TotalH = BadgeH + VersionH;
+        float StartY = 3.f + (HeaderH * 0.5f) - (TotalH * 0.5f);
+
+        ImGui::SameLine(ImGui::GetWindowWidth() - BadgeW - 14.f);
+        ImGui::SetCursorPosY(StartY);
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.353f, 0.388f, 0.478f, 0.8f));
-        ImGui::TextUnformatted(badge);
+        ImGui::TextUnformatted(Badge);
         ImGui::PopStyleColor();
 
-        ImGui::SetCursorPosY(3.f + headerH);
+        ImGui::SetCursorPosY(StartY + BadgeH);
+        ImGui::SetCursorPosX(ImGui::GetWindowWidth() - VersionW - 14.f);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.353f, 0.388f, 0.478f, 0.6f));
+        ImGui::TextUnformatted(FConfiguration::ConsoleVersion);
+        ImGui::PopStyleColor();
+
+        ImGui::SetCursorPosY(3.f + HeaderH);
     }
 
     ImGui::SetCursorPosX(0.f);

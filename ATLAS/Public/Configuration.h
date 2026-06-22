@@ -4,6 +4,8 @@
 
 struct FConfiguration
 {
+	static inline const char* ConsoleVersion = "v1.0.0";
+
 	static inline bool bConsoleEnabled = true;
 	static inline bool bForceRespawns = true;
 	static inline bool bEnableIris = false;
