@@ -6,6 +6,9 @@
 #include "../Public/Icon.h"
 #include "../ImGui/imgui.h"
 
+#include <sstream>
+#include <iomanip>
+
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_ONLY_PNG
 
@@ -211,7 +214,7 @@ static void DestroyConsole()
     if (!Engine || !Engine->GameViewport || !Engine->GameViewport->ViewportConsole)
         return;
 
-    Engine->GameViewport->ViewportConsole->ObjectFlags |= 0x4; // RF_BeginDestroyed — marks it for GC
+    Engine->GameViewport->ViewportConsole->ObjectFlags |= 0x4;
     Engine->GameViewport->ViewportConsole = nullptr;
 }
 
@@ -469,8 +472,35 @@ void GUI_Render()
             DestroyConsole();
     }
 
-    if (ImGui::Checkbox("Potato Graphics", &FConfiguration::bPotatoGraphics))
-		ExecEngine(FConfiguration::bPotatoGraphics ? "r.MipMapLODBias 7" : "r.MipMapLODBias 0"); // for some odd reason this always sets r.MipMapLODBias to 0 and i dont know why
+    /*
+	// LOD bias
+    {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.847f, 0.878f, 0.941f, 1.f));
+        ImGui::Text("Potato Graphics");
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        ImGui::PushItemWidth(180.f);
+
+        if (ImGui::SliderInt("##LODBias", &FConfiguration::LODBias, -3, 7))
+        {
+            std::ostringstream ss;
+            ss.imbue(std::locale::classic());
+            ss << "r.MipMapLODBias " << std::fixed << std::setprecision(1) << FConfiguration::LODBias;
+            std::string Command = ss.str();
+
+            auto Engine = UEngine::GetEngine();
+            if (Engine && Engine->GameViewport && Engine->GameViewport->ViewportConsole)
+            {
+                int len = MultiByteToWideChar(CP_UTF8, 0, Command.c_str(), -1, nullptr, 0);
+                std::wstring ws(len - 1, L'\0');
+                MultiByteToWideChar(CP_UTF8, 0, Command.c_str(), -1, ws.data(), len);
+
+                ((UConsole*)Engine->GameViewport->ViewportConsole)->ConsoleCommand(FString(ws.c_str()));
+            }
+        }
+
+        ImGui::PopItemWidth();
+    } */
 
     // fov
     {
@@ -535,7 +565,7 @@ void GUI_Render()
     else
     {
         char btnLabel[64];
-        snprintf(btnLabel, sizeof(btnLabel), "Rebind GUI Key  [%s]", VKName(FGUI::HotkeyVK));
+        snprintf(btnLabel, sizeof(btnLabel), "Rebind GUI Key    [%s]", VKName(FGUI::HotkeyVK));
         if (ImGui::Button(btnLabel, ImVec2(370.f, 0.f)))
             FGUI::bRebinding = true;
     }
@@ -550,7 +580,7 @@ void GUI_Render()
     else
     {
         char joinBtnLabel[64];
-        snprintf(joinBtnLabel, sizeof(joinBtnLabel), "Rebind Join Key  [%s]", VKName(FGUI::JoinHotkeyVK));
+        snprintf(joinBtnLabel, sizeof(joinBtnLabel), "Rebind Join Key   [%s]", VKName(FGUI::JoinHotkeyVK));
         if (ImGui::Button(joinBtnLabel, ImVec2(370.f, 0.f)))
             FGUI::bRebindingJoin = true;
     }

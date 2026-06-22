@@ -21,7 +21,7 @@ struct FGUI
     static inline ID3D11ShaderResourceView* LogoTexture = nullptr;
     static inline int LogoW = 0, LogoH = 0;
 
-    static inline int  HostType = 0; // 0 = Local Host, 1 = Remote Host
+    static inline int HostType = 0; // 0 = Local Host, 1 = Remote Host
     static inline char RemoteIP[64] = "";
 
     static inline int JoinHotkeyVK = VK_F5;

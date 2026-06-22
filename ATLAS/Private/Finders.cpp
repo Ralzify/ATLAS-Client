@@ -3069,7 +3069,6 @@ _ret:
     return Memcury::Scanner(add);
 }
 
-
 uint64 FindSetIsDoorOpen()
 {
     auto CVar = FindCVar<void>(L"Athena.EnableSlammingThroughDoorsKnockbackPawns");
