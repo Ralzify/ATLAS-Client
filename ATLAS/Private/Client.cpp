@@ -93,6 +93,13 @@ void Client::Init()
 	if (FConfiguration::bConsoleEnabled)
 		UEngine::GetEngine()->GameViewport->ViewportConsole = UGameplayStatics::SpawnObject(UEngine::GetEngine()->ConsoleClass, UEngine::GetEngine()->GameViewport);
 
+	if (VersionInfo.EngineVersion < 4.24)
+		FConfiguration::bEOREnabled = true;
+	else if (VersionInfo.FortniteVersion < 24.30)
+		FConfiguration::bROREnabled = true;
+	//else if (VersionInfo.FortniteVersion < 15.20)
+		//FConfiguration::bDisablePreEdits = true;
+
 	if (VersionInfo.FortniteVersion >= 10 || FConfiguration::bForceRespawns)
 	{
 		auto PrimarySlot = uint8_t(EPlaylistUIExtensionSlot::StaticEnum() ? EPlaylistUIExtensionSlot::GetPrimary() : EUIExtensionSlot::GetPrimary());
