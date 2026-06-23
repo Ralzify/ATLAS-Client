@@ -87,6 +87,10 @@ void GUI_LoadTextures(ID3D11Device* device)
 
 static void PushStyle()
 {
+    ImFontConfig FontConfig;
+    FontConfig.FontDataOwnedByAtlas = false;
+    ImGui::GetIO().Fonts->AddFontFromMemoryTTF((void*)Font, sizeof(Font), 17.f, &FontConfig);
+
     ImGuiStyle& s = ImGui::GetStyle();
 
     s.WindowRounding = 8.f;
@@ -470,7 +474,7 @@ void GUI_Render()
             ImGui::PopItemWidth();
             ImGui::SameLine();
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.353f, 0.388f, 0.478f, 1.f));
-            ImGui::Text("uu");
+            ImGui::Text("ue");
             ImGui::PopStyleColor();
         }
 
