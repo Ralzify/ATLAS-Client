@@ -95,9 +95,9 @@ void Client::Init()
 
 	if (VersionInfo.EngineVersion < 4.24)
 		FConfiguration::bEOREnabled = true;
-	else if (VersionInfo.FortniteVersion < 24.30)
+	if (VersionInfo.FortniteVersion < 24.30)
 		FConfiguration::bROREnabled = true;
-	//else if (VersionInfo.FortniteVersion < 15.20)
+	//if (VersionInfo.FortniteVersion < 15.20)
 		//FConfiguration::bDisablePreEdits = true;
 
 	if (VersionInfo.FortniteVersion >= 10 || FConfiguration::bForceRespawns)
