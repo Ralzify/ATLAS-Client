@@ -294,15 +294,31 @@ void GUI_HandleInput()
 
 void GUI_Render()
 {
-    if (!FGUI::bVisible) 
+    ImGuiIO& io = ImGui::GetIO();
+
+    // Fade animation: ramp toward 1 while visible, toward 0 while hidden.
+    // Driving the whole window (and the backdrop) off this gives a smooth fade in/out.
+    static float s_Fade = 0.f;
+    const float target = FGUI::bVisible ? 1.f : 0.f;
+    const float fadeStep = (io.DeltaTime > 0.f ? io.DeltaTime : 1.f / 60.f) / 0.15f; // ~0.15s
+    if (s_Fade < target) { s_Fade += fadeStep; if (s_Fade > target) s_Fade = target; }
+    else if (s_Fade > target) { s_Fade -= fadeStep; if (s_Fade < target) s_Fade = target; }
+
+    if (s_Fade <= 0.f)
         return;
+
+    const float fade = s_Fade * s_Fade * (3.f - 2.f * s_Fade); // smoothstep easing
+
+    // Full-screen black backdrop behind the menu (50% dim), fading in with it.
+    ImGui::GetBackgroundDrawList()->AddRectFilled(
+        ImVec2(0.f, 0.f), io.DisplaySize, IM_COL32(0, 0, 0, (int)(fade * 0.50f * 255.f)));
 
     ImGuiWindowFlags wflags = ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoTitleBar;
 
-    ImGuiIO& io = ImGui::GetIO();
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Once, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(400.f, 520.f), ImGuiCond_Once);
 
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, fade);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f, 0.f));
     bool open = true;
     ImGui::Begin("##atlas_main", &open, wflags);
@@ -448,13 +464,22 @@ void GUI_Render()
         bool RespawnTimeEnabled = (FConfiguration::RespawnTime > 0);
         bool RespawnHeightEnabled = (FConfiguration::RespawnHeight > 0);
 
+        // Align both rows' sliders to a shared column past the widest checkbox label,
+        // and give them an identical width so the spacing matches exactly.
+        const float RowStartX = ImGui::GetCursorPosX();
+        const float SliderW = 100.f;
+        const float LabelW = ImGui::CalcTextSize("Custom Respawn Height").x; // widest label
+        const float SliderX = RowStartX + ImGui::GetFrameHeight()
+            + ImGui::GetStyle().ItemInnerSpacing.x + LabelW + 16.f;
+
         if (ImGui::Checkbox("Custom Respawn Time", &RespawnTimeEnabled))
             FConfiguration::RespawnTime = RespawnTimeEnabled ? 3 : 0;
 
         if (RespawnTimeEnabled)
         {
             ImGui::SameLine();
-            ImGui::PushItemWidth(80.f);
+            ImGui::SetCursorPosX(SliderX);
+            ImGui::PushItemWidth(SliderW);
             ImGui::SliderInt("##rtime", &FConfiguration::RespawnTime, 1, 30);
             ImGui::PopItemWidth();
             ImGui::SameLine();
@@ -469,7 +494,8 @@ void GUI_Render()
         if (RespawnHeightEnabled)
         {
             ImGui::SameLine();
-            ImGui::PushItemWidth(100.f);
+            ImGui::SetCursorPosX(SliderX);
+            ImGui::PushItemWidth(SliderW);
             ImGui::SliderInt("##rheight", &FConfiguration::RespawnHeight, 1000, 50000);
             ImGui::PopItemWidth();
             ImGui::SameLine();
@@ -613,4 +639,6 @@ void GUI_Render()
     ImGui::EndGroup();
     ImGui::EndChild();
     ImGui::End();
+
+    ImGui::PopStyleVar(); // ImGuiStyleVar_Alpha
 }
