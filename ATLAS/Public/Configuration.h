@@ -8,7 +8,7 @@ struct FConfiguration
 
 	static inline bool bConsoleEnabled = true;
 	static inline bool bForceRespawns = true;
-	static inline bool bEnableIris = false;
+	static inline bool bEnableIris = true; // UE5.3+ (e.g. FN 27.11) needs Iris on the client to connect
 	static inline bool bEOREnabled = false;
 	static inline bool bROREnabled = false;
 	static inline bool bPotatoGraphics = false;

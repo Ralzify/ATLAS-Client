@@ -1,6 +1,7 @@
 ﻿#include "pch.h"
 #include "../Public/Client.h"
 #include "../Public/Configuration.h"
+#include "../Public/Finders.h"
 #include "../Public/GUI.h"
 #include <thread>
 
@@ -221,14 +222,12 @@ void Main()
         UKismetSystemLibrary::ExecuteConsoleCommand(UWorld::GetWorld(), FString(L"log LogIris None"), nullptr);
         UKismetSystemLibrary::ExecuteConsoleCommand(UWorld::GetWorld(), FString(L"log LogIrisRpc None"), nullptr);
         UKismetSystemLibrary::ExecuteConsoleCommand(UWorld::GetWorld(), FString(L"log LogIrisBridge None"), nullptr);
-        auto IrisBool = Memcury::Scanner::FindPattern("83 3D ? ? ? ? ? 0F 8E ? ? ? ? 49 8B B9").RelativeOffset(2, 1).Get();
-        if (IrisBool) *(uint32_t*)IrisBool = true;
-        else
-        {
-            IrisBool = Memcury::Scanner::FindPattern("44 39 25 ? ? ? ? 0F 9F C0 45 84 FF").RelativeOffset(3).Get();
-            if (IrisBool) *(uint32_t*)IrisBool = true;
-        }
-        ForceIris(IrisBool);
+
+        // Resolve the Iris cvar by name (robust across builds) rather than a
+        // version-specific byte pattern, matching the known-good ErbiumClient.
+        auto IrisBool = FindCVar<uint32_t>(L"net.Iris.UseIrisReplication");
+        if (IrisBool) *IrisBool = true;
+        ForceIris(__int64(IrisBool));
     }
     if (VersionInfo.EngineVersion >= 5.4)
     {
