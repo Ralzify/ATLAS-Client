@@ -69,6 +69,7 @@ static HRESULT __stdcall HookedPresent(IDXGISwapChain* pSwapChain, UINT SyncInte
             ID3D11Texture2D* pBackBuffer = nullptr;
 
             pSwapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&pBackBuffer);
+
             if (pBackBuffer)
             {
                 g_pd3dDevice->CreateRenderTargetView(pBackBuffer, nullptr, &g_mainRTV);
@@ -206,14 +207,18 @@ void Main()
     if (VersionInfo.EngineVersion >= 5.0)
     {
         auto RuntimeOptions = DefaultObjImpl("FortRuntimeOptions");
+
         if (RuntimeOptions)
         {
             auto offset = RuntimeOptions->GetOffset("bWaitForServerToBeInitializedBeforeTravelingFeatureEnabled");
+
             if (offset != -1)
                 *(bool*)(__int64(RuntimeOptions) + offset) = false;
         }
+
         UKismetSystemLibrary::ExecuteConsoleCommand(UWorld::GetWorld(), FString(L"log LogFortUIDirector None"), nullptr);
     }
+
     if (VersionInfo.EngineVersion >= 5.1)
         UKismetSystemLibrary::ExecuteConsoleCommand(UWorld::GetWorld(), FString(L"net.AllowEncryption 0"), nullptr);
 
@@ -223,12 +228,14 @@ void Main()
         UKismetSystemLibrary::ExecuteConsoleCommand(UWorld::GetWorld(), FString(L"log LogIrisRpc None"), nullptr);
         UKismetSystemLibrary::ExecuteConsoleCommand(UWorld::GetWorld(), FString(L"log LogIrisBridge None"), nullptr);
 
-        // Resolve the Iris cvar by name (robust across builds) rather than a
-        // version-specific byte pattern, matching the known-good ErbiumClient.
         auto IrisBool = FindCVar<uint32_t>(L"net.Iris.UseIrisReplication");
-        if (IrisBool) *IrisBool = true;
+
+        if (IrisBool) 
+            *IrisBool = true;
+
         ForceIris(__int64(IrisBool));
     }
+
     if (VersionInfo.EngineVersion >= 5.4)
     {
         UKismetSystemLibrary::ExecuteConsoleCommand(UWorld::GetWorld(), FString(L"Fort.MME.TacticalSprint 0"), nullptr);

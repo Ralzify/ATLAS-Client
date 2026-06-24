@@ -22,7 +22,7 @@ extern void* SelectReset(void*);
 #define ACCENT_B 0.808f
 
 static ImVec4 Accent(float a = 1.f) { return ImVec4(ACCENT_R, ACCENT_G, ACCENT_B, a); }
-static ImVec4 AccentDk(float a = 1.f) { return ImVec4(0.f, 0.38f, 0.50f, a); }  // darker for active
+static ImVec4 AccentDk(float a = 1.f) { return ImVec4(0.f, 0.38f, 0.50f, a); }
 
 static const char* VKName(int vk)
 {
@@ -80,13 +80,10 @@ void GUI_LoadTextures(ID3D11Device* device)
     if (!pixels) 
         return;
 
-    // Full mip chain + GPU-generated mips so the high-res (1024x1024) source
-    // downscales smoothly to the small on-screen size instead of aliasing into a
-    // pixelated mess (a plain single-level texture has no mips to filter against).
     D3D11_TEXTURE2D_DESC desc{};
     desc.Width = (UINT)w;
     desc.Height = (UINT)h;
-    desc.MipLevels = 0; // 0 => allocate a full mip chain
+    desc.MipLevels = 0;
     desc.ArraySize = 1;
     desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     desc.SampleDesc.Count = 1;
@@ -100,13 +97,12 @@ void GUI_LoadTextures(ID3D11Device* device)
         ID3D11DeviceContext* ctx = nullptr;
         device->GetImmediateContext(&ctx);
 
-        // upload the full-resolution image into mip 0, then build the smaller mips
         ctx->UpdateSubresource(tex, 0, nullptr, pixels, (UINT)(w * 4), 0);
 
         D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
         srvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-        srvDesc.Texture2D.MipLevels = (UINT)-1; // use all available mips
+        srvDesc.Texture2D.MipLevels = (UINT)-1;
         if (SUCCEEDED(device->CreateShaderResourceView(tex, &srvDesc, &FGUI::LogoTexture)))
         {
             ctx->GenerateMips(FGUI::LogoTexture);
@@ -202,8 +198,6 @@ static void PushStyle()
     col[ImGuiCol_ModalWindowDimBg] = C(0.f, 0.f, 0.f, 0.55f);
 }
 
-// Thin accent rule inset to the content padding. Unlike ImGui::Separator(), which
-// spans the whole window width edge-to-edge, this honours the left/right margins.
 static void AccentRule()
 {
     ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -224,7 +218,6 @@ static void SectionLabel(const char* label)
     ImGui::Spacing();
 }
 
-// One full-width vertical tab in the left sidebar. Returns true on click.
 static bool SidebarTab(const char* label, int index, float height)
 {
     ImGui::PushID(index);
@@ -324,8 +317,6 @@ void GUI_Init()
     PushStyle();
 }
 
-// Keys we never bind to: mouse buttons (vk < 0x08), the bare modifiers, and ESC
-// (reserved to cancel a rebind).
 static bool IsBindableVK(int vk)
 {
     switch (vk)
@@ -341,7 +332,6 @@ static bool IsBindableVK(int vk)
     return true;
 }
 
-// Returns the first bindable key pressed this frame, or 0 if none.
 static int PollBindKey()
 {
     for (int vk = 0x08; vk <= 0xFE; vk++)
@@ -352,7 +342,6 @@ static int PollBindKey()
 
 void GUI_HandleInput()
 {
-    // ESC cancels any pending rebind without changing the bound key.
     if ((FGUI::bRebinding || FGUI::bRebindingJoin) && (GetAsyncKeyState(VK_ESCAPE) & 1))
     {
         FGUI::bRebinding = false;
@@ -393,22 +382,18 @@ void GUI_Render()
 {
     ImGuiIO& io = ImGui::GetIO();
 
-    // Fade animation: ramp toward 1 while visible, toward 0 while hidden.
-    // Driving the whole window (and the backdrop) off this gives a smooth fade in/out.
     static float s_Fade = 0.f;
     const float target = FGUI::bVisible ? 1.f : 0.f;
-    const float fadeStep = (io.DeltaTime > 0.f ? io.DeltaTime : 1.f / 60.f) / 0.15f; // ~0.15s
+    const float fadeStep = (io.DeltaTime > 0.f ? io.DeltaTime : 1.f / 60.f) / 0.15f;
     if (s_Fade < target) { s_Fade += fadeStep; if (s_Fade > target) s_Fade = target; }
     else if (s_Fade > target) { s_Fade -= fadeStep; if (s_Fade < target) s_Fade = target; }
 
     if (s_Fade <= 0.f)
         return;
 
-    const float fade = s_Fade * s_Fade * (3.f - 2.f * s_Fade); // smoothstep easing
+    const float fade = s_Fade * s_Fade * (3.f - 2.f * s_Fade);
 
-    // Full-screen black backdrop behind the menu (50% dim), fading in with it.
-    ImGui::GetBackgroundDrawList()->AddRectFilled(
-        ImVec2(0.f, 0.f), io.DisplaySize, IM_COL32(0, 0, 0, (int)(fade * 0.50f * 255.f)));
+    ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0.f, 0.f), io.DisplaySize, IM_COL32(0, 0, 0, (int)(fade * 0.50f * 255.f)));
 
     ImGuiWindowFlags wflags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoTitleBar;
 
@@ -429,9 +414,8 @@ void GUI_Render()
     const float TopBarH = 46.f;
     const float SidebarW = 118.f;
 
-    // ---- Top bar: logo + branding (left), hotkey badge + version (right) ----
+    // top bar
     {
-        // top bar fill (#0e1118), rounded to match the window's top corners
         ImGui::GetWindowDrawList()->AddRectFilled(
             wp, ImVec2(wp.x + W, wp.y + TopBarH),
             ImGui::GetColorU32(ImVec4(0.0549f, 0.0667f, 0.0941f, 1.f)),
@@ -458,7 +442,6 @@ void GUI_Render()
         ImGui::Text("| Console");
         ImGui::PopStyleColor();
 
-        // version sits inline right after the title
         ImGui::SameLine(0.f, 8.f);
         ImGui::SetCursorPosY(TitleY);
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.353f, 0.388f, 0.478f, 0.6f));
@@ -496,7 +479,7 @@ void GUI_Render()
         }
     }
 
-    // Panel divider lines (drawn on top so the child backgrounds don't cover them).
+	// divider lines
     {
         ImDrawList* fdl = ImGui::GetForegroundDrawList();
         const ImU32 line = IM_COL32(35, 42, 62, (int)(fade * 255.f));
@@ -504,7 +487,6 @@ void GUI_Render()
         fdl->AddLine(ImVec2(wp.x + SidebarW, wp.y + TopBarH), ImVec2(wp.x + SidebarW, wp.y + H), line, 1.f);
     }
 
-    // ---- Sidebar: vertical tabs + animated accent indicator ----
     static const char* kTabs[] = { "Main", "Config" };
     const int kTabCount = (int)(sizeof(kTabs) / sizeof(kTabs[0]));
     const float TabH = 40.f;
@@ -517,17 +499,12 @@ void GUI_Render()
     {
         const ImVec2 sbPos = ImGui::GetWindowPos();
 
-        // Place each tab at an exact Y so they are contiguous (no item-spacing gaps),
-        // which keeps the indicator below lined up with the tab it points at.
         for (int i = 0; i < kTabCount; i++)
         {
             ImGui::SetCursorPos(ImVec2(0.f, TabsTop + i * TabH));
             SidebarTab(kTabs[i], i, TabH);
         }
 
-        // Accent indicator that slides to the active tab. Animated in sidebar-local
-        // space (then offset by sbPos) so it stays glued to the tab while the window
-        // is being dragged instead of lagging/wiggling behind it.
         static float s_IndicatorY = -1.f;
         const float localTarget = TabsTop + FGUI::ActiveTab * TabH + TabH * 0.5f;
         if (s_IndicatorY < 0.f) s_IndicatorY = localTarget;
@@ -543,10 +520,6 @@ void GUI_Render()
     ImGui::PopStyleVar();
     ImGui::PopStyleColor();
 
-    // ---- Content panel: the active tab's controls. The child is physically inset
-    // from the divider and the window's right/bottom edges so nothing hugs the edges,
-    // and it's transparent so the inset margin blends into the window background.
-    // (No per-tab animation; the sidebar indicator is the only tab-switch motion.) ----
     const float ContentPadX = 28.f;
     const float ContentPadTop = 12.f;
     ImGui::SetCursorPos(ImVec2(SidebarW + ContentPadX, TopBarH + ContentPadTop));
@@ -561,14 +534,12 @@ void GUI_Render()
 
     switch (FGUI::ActiveTab)
     {
-    case 0: // Main (Host + Editing + Respawn + Console)
+    case 0: // main tab
     {
         SectionLabel("Host");
 
     const char* hostTypeItems[] = { "Local Host", "Remote Host" };
     ImGui::PushItemWidth(CW);
-    // The content child runs with zero window padding; the dropdown popup would
-    // inherit that and look cramped, so give it its own padding + roomier rows.
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.f, 8.f));
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10.f, 7.f));
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.f, 6.f));
@@ -639,15 +610,11 @@ void GUI_Render()
         bool RespawnTimeEnabled = (FConfiguration::RespawnTime > 0);
         bool RespawnHeightEnabled = (FConfiguration::RespawnHeight > 0);
 
-        // Align both rows' sliders to a shared column past the widest checkbox label,
-        // and give them an identical width that fills the remaining space (minus room
-        // for the unit label) so they stay equal and fit at any window width.
         const float RowStartX = ImGui::GetCursorPosX();
         const float RowAvail = ImGui::GetContentRegionAvail().x;
-        const float LabelW = ImGui::CalcTextSize("Custom Respawn Height").x; // widest label
-        const float SliderX = RowStartX + ImGui::GetFrameHeight()
-            + ImGui::GetStyle().ItemInnerSpacing.x + LabelW + 16.f;
-        float SliderW = (RowStartX + RowAvail) - SliderX - 42.f; // 42px reserved for unit
+        const float LabelW = ImGui::CalcTextSize("Custom Respawn Height").x;
+        const float SliderX = RowStartX + ImGui::GetFrameHeight() + ImGui::GetStyle().ItemInnerSpacing.x + LabelW + 16.f;
+        float SliderW = (RowStartX + RowAvail) - SliderX - 42.f;
         if (SliderW < 60.f) SliderW = 60.f;
 
         if (ImGui::Checkbox("Custom Respawn Time", &RespawnTimeEnabled))
@@ -683,11 +650,11 @@ void GUI_Render()
         }
 
         //ImGui::Unindent(16.f);
-        }
+    }
 
-        SectionLabel("Console");
+    SectionLabel("Console");
 
-        if (ImGui::Checkbox("Console Enabled", &FConfiguration::bConsoleEnabled))
+    if (ImGui::Checkbox("Console Enabled", &FConfiguration::bConsoleEnabled))
     {
         if (FConfiguration::bConsoleEnabled)
             SpawnConsole();
@@ -780,7 +747,7 @@ void GUI_Render()
     }
     case 1: // Config
     {
-        if (FGUI::bRebinding)
+    if (FGUI::bRebinding)
     {
         ImGui::PushStyleColor(ImGuiCol_Text, Accent());
         ImGui::PushStyleColor(ImGuiCol_Button, Accent(0.18f));
@@ -831,5 +798,5 @@ void GUI_Render()
     ImGui::PopStyleColor();
     ImGui::End();
 
-    ImGui::PopStyleVar(); // ImGuiStyleVar_Alpha
+    ImGui::PopStyleVar();
 }
