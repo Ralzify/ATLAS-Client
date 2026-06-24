@@ -16,6 +16,8 @@ struct FGUI
     static inline int HotkeyVK = VK_F9;
     static inline bool bRebinding = false;
 
+    static inline int ActiveTab = 0; // selected sidebar tab
+
     // static inline int Resolution = 0;
 
     static inline ID3D11ShaderResourceView* LogoTexture = nullptr;

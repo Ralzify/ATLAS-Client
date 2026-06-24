@@ -26,6 +26,8 @@ static ImVec4 AccentDk(float a = 1.f) { return ImVec4(0.f, 0.38f, 0.50f, a); }  
 
 static const char* VKName(int vk)
 {
+    static char buf[32];
+
     switch (vk)
     {
     case VK_F1:  return "F1";  case VK_F2:  return "F2";
@@ -37,8 +39,31 @@ static const char* VKName(int vk)
     case VK_INSERT: return "INSERT"; case VK_DELETE: return "DELETE";
     case VK_HOME:   return "HOME";   case VK_END:    return "END";
     case VK_PRIOR:  return "PGUP";   case VK_NEXT:   return "PGDN";
-    default:        return "???";
+    case VK_SPACE:  return "SPACE";  case VK_RETURN: return "ENTER";
+    case VK_TAB:    return "TAB";    case VK_BACK:   return "BACKSPACE";
+    case VK_LEFT:   return "LEFT";   case VK_RIGHT:  return "RIGHT";
+    case VK_UP:     return "UP";     case VK_DOWN:   return "DOWN";
+    case VK_CAPITAL: return "CAPS";  case VK_OEM_3:  return "`";
     }
+
+    if (vk >= '0' && vk <= '9') { buf[0] = (char)vk; buf[1] = '\0'; return buf; }
+    if (vk >= 'A' && vk <= 'Z') { buf[0] = (char)vk; buf[1] = '\0'; return buf; }
+
+    if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9)
+    {
+        snprintf(buf, sizeof(buf), "NUM%d", vk - VK_NUMPAD0);
+        return buf;
+    }
+
+    // Fall back to the OS name for anything else (OEM/punctuation keys etc.).
+    UINT sc = MapVirtualKeyW((UINT)vk, MAPVK_VK_TO_VSC);
+    wchar_t wname[32]{};
+    if (sc != 0 && GetKeyNameTextW((LONG)(sc << 16), wname, 32) > 0 &&
+        WideCharToMultiByte(CP_UTF8, 0, wname, -1, buf, sizeof(buf), nullptr, nullptr) > 0)
+        return buf;
+
+    snprintf(buf, sizeof(buf), "0x%02X", vk);
+    return buf;
 }
 
 void FGUI::SaveHotkey() { HotkeyPersist::Save(FGUI::HotkeyVK); }
@@ -55,31 +80,42 @@ void GUI_LoadTextures(ID3D11Device* device)
     if (!pixels) 
         return;
 
+    // Full mip chain + GPU-generated mips so the high-res (1024x1024) source
+    // downscales smoothly to the small on-screen size instead of aliasing into a
+    // pixelated mess (a plain single-level texture has no mips to filter against).
     D3D11_TEXTURE2D_DESC desc{};
     desc.Width = (UINT)w;
     desc.Height = (UINT)h;
-    desc.MipLevels = 1;
+    desc.MipLevels = 0; // 0 => allocate a full mip chain
     desc.ArraySize = 1;
     desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     desc.SampleDesc.Count = 1;
     desc.Usage = D3D11_USAGE_DEFAULT;
-    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-
-    D3D11_SUBRESOURCE_DATA initData{};
-    initData.pSysMem = pixels;
-    initData.SysMemPitch = (UINT)(w * 4);
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    desc.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
 
     ID3D11Texture2D* tex = nullptr;
-    if (SUCCEEDED(device->CreateTexture2D(&desc, &initData, &tex)))
+    if (SUCCEEDED(device->CreateTexture2D(&desc, nullptr, &tex)))
     {
+        ID3D11DeviceContext* ctx = nullptr;
+        device->GetImmediateContext(&ctx);
+
+        // upload the full-resolution image into mip 0, then build the smaller mips
+        ctx->UpdateSubresource(tex, 0, nullptr, pixels, (UINT)(w * 4), 0);
+
         D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
         srvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-        srvDesc.Texture2D.MipLevels = 1;
-        device->CreateShaderResourceView(tex, &srvDesc, &FGUI::LogoTexture);
+        srvDesc.Texture2D.MipLevels = (UINT)-1; // use all available mips
+        if (SUCCEEDED(device->CreateShaderResourceView(tex, &srvDesc, &FGUI::LogoTexture)))
+        {
+            ctx->GenerateMips(FGUI::LogoTexture);
+            FGUI::LogoW = w;
+            FGUI::LogoH = h;
+        }
+
+        if (ctx) ctx->Release();
         tex->Release();
-        FGUI::LogoW = w;
-        FGUI::LogoH = h;
     }
 
     stbi_image_free(pixels);
@@ -113,7 +149,7 @@ static void PushStyle()
     auto C = [](float r, float g, float b, float a = 1.f) { return ImVec4(r, g, b, a); };
     ImVec4* col = s.Colors;
 
-    col[ImGuiCol_WindowBg] = C(0.043f, 0.051f, 0.071f, 0.97f);
+    col[ImGuiCol_WindowBg] = C(0.0667f, 0.0824f, 0.1216f, 1.f); // #11151f
     col[ImGuiCol_ChildBg] = C(0.066f, 0.082f, 0.122f, 1.f);
     col[ImGuiCol_PopupBg] = C(0.066f, 0.082f, 0.122f, 0.98f);
     col[ImGuiCol_Border] = C(0.137f, 0.165f, 0.243f, 1.f);
@@ -140,9 +176,9 @@ static void PushStyle()
     col[ImGuiCol_Separator] = C(0.137f, 0.165f, 0.243f, 1.f);
     col[ImGuiCol_SeparatorHovered] = Accent(0.4f);
     col[ImGuiCol_SeparatorActive] = Accent(1.f);
-    col[ImGuiCol_ResizeGrip] = C(0.f, 0.f, 0.f, 0.f);
-    col[ImGuiCol_ResizeGripHovered] = C(0.f, 0.f, 0.f, 0.f);
-    col[ImGuiCol_ResizeGripActive] = C(0.f, 0.f, 0.f, 0.f);
+    col[ImGuiCol_ResizeGrip] = Accent(0.22f);
+    col[ImGuiCol_ResizeGripHovered] = Accent(0.55f);
+    col[ImGuiCol_ResizeGripActive] = Accent(0.90f);
     col[ImGuiCol_Tab] = C(0.066f, 0.082f, 0.122f, 1.f);
     col[ImGuiCol_TabHovered] = Accent(0.2f);
     col[ImGuiCol_TabActive] = C(0.094f, 0.114f, 0.165f, 1.f);
@@ -166,16 +202,58 @@ static void PushStyle()
     col[ImGuiCol_ModalWindowDimBg] = C(0.f, 0.f, 0.f, 0.55f);
 }
 
+// Thin accent rule inset to the content padding. Unlike ImGui::Separator(), which
+// spans the whole window width edge-to-edge, this honours the left/right margins.
+static void AccentRule()
+{
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const float w = ImGui::GetContentRegionAvail().x;
+    dl->AddLine(ImVec2(p.x, p.y + 1.f), ImVec2(p.x + w, p.y + 1.f),
+        ImGui::GetColorU32(Accent(0.25f)), 1.f);
+    ImGui::Dummy(ImVec2(0.f, 3.f));
+}
+
 static void SectionLabel(const char* label)
 {
     ImGui::Spacing();
     ImGui::PushStyleColor(ImGuiCol_Text, Accent(0.85f));
     ImGui::TextUnformatted(label);
     ImGui::PopStyleColor();
-    ImGui::PushStyleColor(ImGuiCol_Separator, Accent(0.25f));
-    ImGui::Separator();
-    ImGui::PopStyleColor();
+    AccentRule();
     ImGui::Spacing();
+}
+
+// One full-width vertical tab in the left sidebar. Returns true on click.
+static bool SidebarTab(const char* label, int index, float height)
+{
+    ImGui::PushID(index);
+    const bool active = (FGUI::ActiveTab == index);
+
+    const ImVec2 size(ImGui::GetContentRegionAvail().x, height);
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+
+    const bool pressed = ImGui::InvisibleButton("##tab", size);
+    const bool hovered = ImGui::IsItemHovered();
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+
+    if (active)
+        dl->AddRectFilled(p, ImVec2(p.x + size.x, p.y + size.y), ImGui::GetColorU32(Accent(0.10f)));
+    else if (hovered)
+        dl->AddRectFilled(p, ImVec2(p.x + size.x, p.y + size.y), ImGui::GetColorU32(Accent(0.05f)));
+
+    ImVec4 textCol = active ? Accent() : ImVec4(0.50f, 0.55f, 0.66f, 1.f);
+    if (!active && hovered) textCol = ImVec4(0.78f, 0.82f, 0.90f, 1.f);
+
+    const ImVec2 ts = ImGui::CalcTextSize(label);
+    dl->AddText(ImVec2(p.x + 26.f, p.y + (size.y - ts.y) * 0.5f), ImGui::GetColorU32(textCol), label);
+
+    if (pressed)
+        FGUI::ActiveTab = index;
+
+    ImGui::PopID();
+    return pressed;
 }
 
 static void Exec(const char* cmd)
@@ -242,46 +320,65 @@ static void JoinSelectedHost()
 void GUI_Init()
 {
     FGUI::LoadHotkey();
+    FGUI::LoadJoinHotkey();
     PushStyle();
+}
+
+// Keys we never bind to: mouse buttons (vk < 0x08), the bare modifiers, and ESC
+// (reserved to cancel a rebind).
+static bool IsBindableVK(int vk)
+{
+    switch (vk)
+    {
+    case VK_ESCAPE:
+    case VK_SHIFT: case VK_CONTROL: case VK_MENU:
+    case VK_LSHIFT: case VK_RSHIFT:
+    case VK_LCONTROL: case VK_RCONTROL:
+    case VK_LMENU: case VK_RMENU:
+    case VK_LWIN: case VK_RWIN:
+        return false;
+    }
+    return true;
+}
+
+// Returns the first bindable key pressed this frame, or 0 if none.
+static int PollBindKey()
+{
+    for (int vk = 0x08; vk <= 0xFE; vk++)
+        if (IsBindableVK(vk) && (GetAsyncKeyState(vk) & 1))
+            return vk;
+    return 0;
 }
 
 void GUI_HandleInput()
 {
-    static const int candidates[] = {
-        VK_F1, VK_F2, VK_F3, VK_F4, VK_F5,  VK_F6,
-        VK_F7, VK_F8, VK_F9, VK_F10, VK_F11, VK_F12,
-        VK_INSERT, VK_DELETE, VK_HOME, VK_END, VK_PRIOR, VK_NEXT
-    };
+    // ESC cancels any pending rebind without changing the bound key.
+    if ((FGUI::bRebinding || FGUI::bRebindingJoin) && (GetAsyncKeyState(VK_ESCAPE) & 1))
+    {
+        FGUI::bRebinding = false;
+        FGUI::bRebindingJoin = false;
+        return;
+    }
 
     if (FGUI::bRebinding)
     {
-        for (int vk : candidates)
+        if (int vk = PollBindKey())
         {
-            if (GetAsyncKeyState(vk) & 1)
-            {
-                FGUI::HotkeyVK = vk;
-                FGUI::bRebinding = false;
-                FGUI::SaveHotkey();
-                break;
-            }
+            FGUI::HotkeyVK = vk;
+            FGUI::bRebinding = false;
+            FGUI::SaveHotkey();
         }
-
         return;
     }
 
     if (FGUI::bRebindingJoin)
     {
-        for (int vk : candidates)
+        if (int vk = PollBindKey())
         {
-            if (GetAsyncKeyState(vk) & 1)
-            {
-                FGUI::JoinHotkeyVK = vk;
-                FGUI::bRebindingJoin = false;
-                FGUI::SaveJoinHotkey();
-                break;
-            }
+            FGUI::JoinHotkeyVK = vk;
+            FGUI::bRebindingJoin = false;
+            FGUI::SaveJoinHotkey();
         }
-
         return;
     }
 
@@ -313,10 +410,11 @@ void GUI_Render()
     ImGui::GetBackgroundDrawList()->AddRectFilled(
         ImVec2(0.f, 0.f), io.DisplaySize, IM_COL32(0, 0, 0, (int)(fade * 0.50f * 255.f)));
 
-    ImGuiWindowFlags wflags = ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoTitleBar;
+    ImGuiWindowFlags wflags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoTitleBar;
 
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Once, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(400.f, 520.f), ImGuiCond_Once);
+    ImGui::SetNextWindowSize(ImVec2(580.f, 410.f), ImGuiCond_Once);
+    ImGui::SetNextWindowSizeConstraints(ImVec2(500.f, 320.f), ImVec2(10000.f, 10000.f));
 
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, fade);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f, 0.f));
@@ -324,99 +422,176 @@ void GUI_Render()
     ImGui::Begin("##atlas_main", &open, wflags);
     ImGui::PopStyleVar();
 
+    const float W = ImGui::GetWindowWidth();
+    const float H = ImGui::GetWindowHeight();
+    const ImVec2 wp = ImGui::GetWindowPos();
+
+    const float TopBarH = 46.f;
+    const float SidebarW = 118.f;
+
+    // ---- Top bar: logo + branding (left), hotkey badge + version (right) ----
     {
-        ImDrawList* dl = ImGui::GetWindowDrawList();
-        ImVec2 wp = ImGui::GetWindowPos();
-        ImVec2 ws = ImGui::GetWindowSize();
-        //dl->AddRectFilled(wp, ImVec2(wp.x + ws.x, wp.y + 2.f), IM_COL32(11, 13, 18, 255)); // delete??
-    }
+        // top bar fill (#0e1118), rounded to match the window's top corners
+        ImGui::GetWindowDrawList()->AddRectFilled(
+            wp, ImVec2(wp.x + W, wp.y + TopBarH),
+            ImGui::GetColorU32(ImVec4(0.0549f, 0.0667f, 0.0941f, 1.f)),
+            ImGui::GetStyle().WindowRounding, ImDrawFlags_RoundCornersTop);
 
-    ImGui::SetCursorPosY(3.f);
+        const float LogoSize = 30.f;
+        const float PadL = 14.f;
 
-    // title bar
-    {
-        const float HeaderH = 52.f;
-        const float LogoSize = 40.f;
-        const float PadL = 12.f;
-
-        ImGui::SetCursorPos(ImVec2(PadL, 3.f + (HeaderH - LogoSize) * 0.5f));
-
+        ImGui::SetCursorPos(ImVec2(PadL, (TopBarH - LogoSize) * 0.5f));
         if (FGUI::LogoTexture)
             ImGui::Image((ImTextureID)FGUI::LogoTexture, ImVec2(LogoSize, LogoSize));
         else
             ImGui::Dummy(ImVec2(LogoSize, LogoSize));
 
         ImGui::SameLine(PadL + LogoSize + 8.f);
-        const float TitleY = 3.f + (HeaderH * 0.5f) - ImGui::GetTextLineHeight() * 0.5f;
+        const float TitleY = (TopBarH - ImGui::GetTextLineHeight()) * 0.5f;
         ImGui::SetCursorPosY(TitleY);
-
         ImGui::PushStyleColor(ImGuiCol_Text, Accent());
         ImGui::Text("ATLAS");
         ImGui::PopStyleColor();
         ImGui::SameLine(0.f, 6.f);
         ImGui::SetCursorPosY(TitleY);
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.353f, 0.388f, 0.478f, 1.f));
-        ImGui::Text("| console");
+        ImGui::Text("| Console");
         ImGui::PopStyleColor();
 
-        char Badge[32];
-        snprintf(Badge, sizeof(Badge), "[%s]", VKName(FGUI::HotkeyVK));
-        float BadgeW = ImGui::CalcTextSize(Badge).x;
-        float BadgeH = ImGui::GetTextLineHeight();
-
-        float VersionW = ImGui::CalcTextSize(FConfiguration::ConsoleVersion).x;
-        float VersionH = ImGui::GetTextLineHeight();
-
-        float TotalH = BadgeH + VersionH;
-        float StartY = 3.f + (HeaderH * 0.5f) - (TotalH * 0.5f);
-
-        ImGui::SameLine(ImGui::GetWindowWidth() - BadgeW - 14.f);
-        ImGui::SetCursorPosY(StartY);
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.353f, 0.388f, 0.478f, 0.8f));
-        ImGui::TextUnformatted(Badge);
-        ImGui::PopStyleColor();
-
-        ImGui::SetCursorPosY(StartY + BadgeH);
-        ImGui::SetCursorPosX(ImGui::GetWindowWidth() - VersionW - 14.f);
+        // version sits inline right after the title
+        ImGui::SameLine(0.f, 8.f);
+        ImGui::SetCursorPosY(TitleY);
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.353f, 0.388f, 0.478f, 0.6f));
         ImGui::TextUnformatted(FConfiguration::ConsoleVersion);
         ImGui::PopStyleColor();
 
-        ImGui::SetCursorPosY(3.f + HeaderH);
+        char Badge[32];
+        snprintf(Badge, sizeof(Badge), "[%s]", VKName(FGUI::HotkeyVK));
+        const float BadgeW = ImGui::CalcTextSize(Badge).x;
+        const float BadgeH = ImGui::GetTextLineHeight();
+
+        // Close button pinned to the top-right; the hotkey badge sits to its left.
+        const float CloseSize = 22.f;
+        const float CloseX = W - CloseSize - 12.f;
+
+        ImGui::SetCursorPos(ImVec2(CloseX - 12.f - BadgeW, (TopBarH - BadgeH) * 0.5f));
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.353f, 0.388f, 0.478f, 0.85f));
+        ImGui::TextUnformatted(Badge);
+        ImGui::PopStyleColor();
+
+        ImGui::SetCursorPos(ImVec2(CloseX, (TopBarH - CloseSize) * 0.5f));
+        if (ImGui::InvisibleButton("##closebtn", ImVec2(CloseSize, CloseSize)))
+            FGUI::bVisible = false;
+        {
+            const bool hovered = ImGui::IsItemHovered();
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            const ImVec2 rmin = ImGui::GetItemRectMin();
+            const ImVec2 rmax = ImGui::GetItemRectMax();
+            if (hovered)
+                dl->AddRectFilled(rmin, rmax, ImGui::GetColorU32(Accent(0.20f)), 4.f);
+            const float pad = 6.f;
+            const ImU32 xcol = ImGui::GetColorU32(hovered ? Accent() : ImVec4(0.55f, 0.60f, 0.70f, 1.f));
+            dl->AddLine(ImVec2(rmin.x + pad, rmin.y + pad), ImVec2(rmax.x - pad, rmax.y - pad), xcol, 1.6f);
+            dl->AddLine(ImVec2(rmax.x - pad, rmin.y + pad), ImVec2(rmin.x + pad, rmax.y - pad), xcol, 1.6f);
+        }
     }
 
-    ImGui::SetCursorPosX(0.f);
-    ImGui::PushStyleColor(ImGuiCol_Separator, ImVec4(0.137f, 0.165f, 0.243f, 1.f));
-    ImGui::Separator();
+    // Panel divider lines (drawn on top so the child backgrounds don't cover them).
+    {
+        ImDrawList* fdl = ImGui::GetForegroundDrawList();
+        const ImU32 line = IM_COL32(35, 42, 62, (int)(fade * 255.f));
+        fdl->AddLine(ImVec2(wp.x, wp.y + TopBarH), ImVec2(wp.x + W, wp.y + TopBarH), line, 1.f);
+        fdl->AddLine(ImVec2(wp.x + SidebarW, wp.y + TopBarH), ImVec2(wp.x + SidebarW, wp.y + H), line, 1.f);
+    }
+
+    // ---- Sidebar: vertical tabs + animated accent indicator ----
+    static const char* kTabs[] = { "Main", "Config" };
+    const int kTabCount = (int)(sizeof(kTabs) / sizeof(kTabs[0]));
+    const float TabH = 40.f;
+    const float TabsTop = 12.f;
+
+    ImGui::SetCursorPos(ImVec2(0.f, TopBarH));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0549f, 0.0667f, 0.0941f, 1.f)); // #0e1118
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f, 0.f));
+    ImGui::BeginChild("##sidebar", ImVec2(SidebarW, H - TopBarH), false, ImGuiWindowFlags_NoScrollbar);
+    {
+        const ImVec2 sbPos = ImGui::GetWindowPos();
+
+        // Place each tab at an exact Y so they are contiguous (no item-spacing gaps),
+        // which keeps the indicator below lined up with the tab it points at.
+        for (int i = 0; i < kTabCount; i++)
+        {
+            ImGui::SetCursorPos(ImVec2(0.f, TabsTop + i * TabH));
+            SidebarTab(kTabs[i], i, TabH);
+        }
+
+        // Accent indicator that slides to the active tab. Animated in sidebar-local
+        // space (then offset by sbPos) so it stays glued to the tab while the window
+        // is being dragged instead of lagging/wiggling behind it.
+        static float s_IndicatorY = -1.f;
+        const float localTarget = TabsTop + FGUI::ActiveTab * TabH + TabH * 0.5f;
+        if (s_IndicatorY < 0.f) s_IndicatorY = localTarget;
+        float lerp = io.DeltaTime * 16.f;
+        if (lerp > 1.f) lerp = 1.f;
+        s_IndicatorY += (localTarget - s_IndicatorY) * lerp;
+        const float indY = sbPos.y + s_IndicatorY;
+        ImGui::GetWindowDrawList()->AddRectFilled(
+            ImVec2(sbPos.x, indY - 9.f), ImVec2(sbPos.x + 3.f, indY + 9.f),
+            ImGui::GetColorU32(Accent()), 2.f);
+    }
+    ImGui::EndChild();
+    ImGui::PopStyleVar();
     ImGui::PopStyleColor();
 
-    ImGui::BeginChild("##content", ImVec2(0.f, -1.f), false, ImGuiWindowFlags_NoScrollbar);
-    ImGui::SetCursorPosX(14.f);
-    ImGui::BeginGroup();
+    // ---- Content panel: the active tab's controls. The child is physically inset
+    // from the divider and the window's right/bottom edges so nothing hugs the edges,
+    // and it's transparent so the inset margin blends into the window background.
+    // (No per-tab animation; the sidebar indicator is the only tab-switch motion.) ----
+    const float ContentPadX = 28.f;
+    const float ContentPadTop = 12.f;
+    ImGui::SetCursorPos(ImVec2(SidebarW + ContentPadX, TopBarH + ContentPadTop));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.f, 0.f, 0.f, 0.f));
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, fade);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f, 0.f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.f, 10.f));
+    ImGui::BeginChild("##content",
+        ImVec2((W - SidebarW) - ContentPadX * 2.f, (H - TopBarH) - ContentPadTop - 12.f), false);
 
-    SectionLabel("HOST TYPE");
+    const float CW = ImGui::GetContentRegionAvail().x;
+
+    switch (FGUI::ActiveTab)
+    {
+    case 0: // Main (Host + Editing + Respawn + Console)
+    {
+        SectionLabel("Host");
 
     const char* hostTypeItems[] = { "Local Host", "Remote Host" };
-    ImGui::PushItemWidth(370.f);
+    ImGui::PushItemWidth(CW);
+    // The content child runs with zero window padding; the dropdown popup would
+    // inherit that and look cramped, so give it its own padding + roomier rows.
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.f, 8.f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10.f, 7.f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.f, 6.f));
     ImGui::Combo("##hosttype", &FGUI::HostType, hostTypeItems, 2);
+    ImGui::PopStyleVar(3);
     ImGui::PopItemWidth();
 
     ImGui::Spacing();
 
     if (FGUI::HostType == 0)
     {
-        if (ImGui::Button("Join Local Host", ImVec2(370.f, 0.f)))
+        if (ImGui::Button("Join Local Host", ImVec2(CW, 0.f)))
             JoinSelectedHost();
     }
     else
     {
-        ImGui::PushItemWidth(370.f);
+        ImGui::PushItemWidth(CW);
         ImGui::InputTextWithHint("##remoteip", "Enter IP to join", FGUI::RemoteIP, sizeof(FGUI::RemoteIP));
         ImGui::PopItemWidth();
 
         ImGui::Spacing();
 
-        if (ImGui::Button("Join Remote Host", ImVec2(370.f, 0.f)))
+        if (ImGui::Button("Join Remote Host", ImVec2(CW, 0.f)))
             JoinSelectedHost();
     }
 
@@ -425,9 +600,9 @@ void GUI_Render()
     ImGui::TextWrapped("Pressing this key joins the currently selected host type.");
     ImGui::PopStyleColor();
 
-    if (VersionInfo.FortniteVersion < 24.30)
-    {
-        SectionLabel("EDITING");
+        if (VersionInfo.FortniteVersion < 24.30)
+        {
+        SectionLabel("Editing");
 
         if (VersionInfo.EngineVersion < 4.24)
         {
@@ -451,11 +626,11 @@ void GUI_Render()
         {
             ImGui::Checkbox("Disable Pre-Edits", &FConfiguration::bDisablePreEdits);
         }
-    }
+        }
 
-    SectionLabel("RESPAWNING");
+        SectionLabel("Respawn");
 
-    ImGui::Checkbox("Respawns Enabled", &FConfiguration::bForceRespawns);
+        ImGui::Checkbox("Respawns Enabled", &FConfiguration::bForceRespawns);
 
     if (FConfiguration::bForceRespawns)
     {
@@ -465,12 +640,15 @@ void GUI_Render()
         bool RespawnHeightEnabled = (FConfiguration::RespawnHeight > 0);
 
         // Align both rows' sliders to a shared column past the widest checkbox label,
-        // and give them an identical width so the spacing matches exactly.
+        // and give them an identical width that fills the remaining space (minus room
+        // for the unit label) so they stay equal and fit at any window width.
         const float RowStartX = ImGui::GetCursorPosX();
-        const float SliderW = 100.f;
+        const float RowAvail = ImGui::GetContentRegionAvail().x;
         const float LabelW = ImGui::CalcTextSize("Custom Respawn Height").x; // widest label
         const float SliderX = RowStartX + ImGui::GetFrameHeight()
             + ImGui::GetStyle().ItemInnerSpacing.x + LabelW + 16.f;
+        float SliderW = (RowStartX + RowAvail) - SliderX - 42.f; // 42px reserved for unit
+        if (SliderW < 60.f) SliderW = 60.f;
 
         if (ImGui::Checkbox("Custom Respawn Time", &RespawnTimeEnabled))
             FConfiguration::RespawnTime = RespawnTimeEnabled ? 3 : 0;
@@ -505,11 +683,11 @@ void GUI_Render()
         }
 
         //ImGui::Unindent(16.f);
-    }
+        }
 
-    SectionLabel("CONSOLE");
+        SectionLabel("Console");
 
-    if (ImGui::Checkbox("Console Enabled", &FConfiguration::bConsoleEnabled))
+        if (ImGui::Checkbox("Console Enabled", &FConfiguration::bConsoleEnabled))
     {
         if (FConfiguration::bConsoleEnabled)
             SpawnConsole();
@@ -598,36 +776,44 @@ void GUI_Render()
         ImGui::PopItemWidth();
     } */
 
-    SectionLabel("HOTKEYS");
-
-    if (FGUI::bRebinding)
+        break;
+    }
+    case 1: // Config
+    {
+        if (FGUI::bRebinding)
     {
         ImGui::PushStyleColor(ImGuiCol_Text, Accent());
         ImGui::PushStyleColor(ImGuiCol_Button, Accent(0.18f));
-        ImGui::Button("Press any key...", ImVec2(370.f, 0.f));
+        ImGui::Button("Press any key...  (Esc to cancel)", ImVec2(CW, 0.f));
         ImGui::PopStyleColor(2);
     }
     else
     {
         char btnLabel[64];
         snprintf(btnLabel, sizeof(btnLabel), "Rebind GUI Key    [%s]", VKName(FGUI::HotkeyVK));
-        if (ImGui::Button(btnLabel, ImVec2(370.f, 0.f)))
+        if (ImGui::Button(btnLabel, ImVec2(CW, 0.f)))
+        {
             FGUI::bRebinding = true;
+            FGUI::bRebindingJoin = false;
+        }
     }
 
     if (FGUI::bRebindingJoin)
     {
         ImGui::PushStyleColor(ImGuiCol_Text, Accent());
         ImGui::PushStyleColor(ImGuiCol_Button, Accent(0.18f));
-        ImGui::Button("Press any key...", ImVec2(370.f, 0.f));
+        ImGui::Button("Press any key...  (Esc to cancel)", ImVec2(CW, 0.f));
         ImGui::PopStyleColor(2);
     }
     else
     {
         char joinBtnLabel[64];
         snprintf(joinBtnLabel, sizeof(joinBtnLabel), "Rebind Join Key   [%s]", VKName(FGUI::JoinHotkeyVK));
-        if (ImGui::Button(joinBtnLabel, ImVec2(370.f, 0.f)))
+        if (ImGui::Button(joinBtnLabel, ImVec2(CW, 0.f)))
+        {
             FGUI::bRebindingJoin = true;
+            FGUI::bRebinding = false;
+        }
     }
 
     ImGui::Spacing();
@@ -635,9 +821,14 @@ void GUI_Render()
     ImGui::TextWrapped("Hotkey is saved automatically and will persist across sessions.");
     ImGui::PopStyleColor();
 
-    ImGui::Dummy(ImVec2(0.f, 8.f));
-    ImGui::EndGroup();
+        ImGui::Dummy(ImVec2(0.f, 8.f));
+        break;
+    }
+    }
+
     ImGui::EndChild();
+    ImGui::PopStyleVar(3);
+    ImGui::PopStyleColor();
     ImGui::End();
 
     ImGui::PopStyleVar(); // ImGuiStyleVar_Alpha
