@@ -19,12 +19,43 @@ static HWND g_hWnd = nullptr;
 static bool g_ImGuiReady = false;
 
 typedef HRESULT(__stdcall* Present_t)(IDXGISwapChain*, UINT, UINT);
+typedef HRESULT(__stdcall* ResizeBuffers_t)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
 static Present_t OriginalPresent = nullptr;
+static ResizeBuffers_t OriginalResizeBuffers = nullptr;
 
 static WNDPROC OriginalWndProc = nullptr;
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 
 static bool g_WasVisible = false;
+
+static void ReleaseMainRenderTarget()
+{
+    if (g_pd3dContext)
+        g_pd3dContext->OMSetRenderTargets(0, nullptr, nullptr);
+
+    if (g_mainRTV)
+    {
+        g_mainRTV->Release();
+        g_mainRTV = nullptr;
+    }
+}
+
+static bool CreateMainRenderTarget(IDXGISwapChain* pSwapChain)
+{
+    if (!g_pd3dDevice || !pSwapChain)
+        return false;
+
+    ID3D11Texture2D* pBackBuffer = nullptr;
+    HRESULT hr = pSwapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&pBackBuffer);
+
+    if (FAILED(hr) || !pBackBuffer)
+        return false;
+
+    hr = g_pd3dDevice->CreateRenderTargetView(pBackBuffer, nullptr, &g_mainRTV);
+    pBackBuffer->Release();
+
+    return SUCCEEDED(hr);
+}
 
 static LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
@@ -66,15 +97,7 @@ static HRESULT __stdcall HookedPresent(IDXGISwapChain* pSwapChain, UINT SyncInte
             pSwapChain->GetDesc(&sd);
             g_hWnd = sd.OutputWindow;
 
-            ID3D11Texture2D* pBackBuffer = nullptr;
-
-            pSwapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&pBackBuffer);
-
-            if (pBackBuffer)
-            {
-                g_pd3dDevice->CreateRenderTargetView(pBackBuffer, nullptr, &g_mainRTV);
-                pBackBuffer->Release();
-            }
+            CreateMainRenderTarget(pSwapChain);
 
             OriginalWndProc = (WNDPROC)SetWindowLongPtrW(g_hWnd, GWLP_WNDPROC, (LONG_PTR)HookedWndProc);
 
@@ -96,6 +119,9 @@ static HRESULT __stdcall HookedPresent(IDXGISwapChain* pSwapChain, UINT SyncInte
 
     if (g_ImGuiReady)
     {
+        if (!g_mainRTV)
+            CreateMainRenderTarget(pSwapChain);
+
         GUI_HandleInput();
 
         if (FGUI::bVisible != g_WasVisible)
@@ -127,14 +153,29 @@ static HRESULT __stdcall HookedPresent(IDXGISwapChain* pSwapChain, UINT SyncInte
         ImGui::EndFrame();
         ImGui::Render();
 
-        g_pd3dContext->OMSetRenderTargets(1, &g_mainRTV, nullptr);
-        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+        if (g_mainRTV)
+        {
+            g_pd3dContext->OMSetRenderTargets(1, &g_mainRTV, nullptr);
+            ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+        }
     }
 
     return OriginalPresent(pSwapChain, SyncInterval, Flags);
 }
 
-static Present_t GetPresentAddress()
+static HRESULT __stdcall HookedResizeBuffers(IDXGISwapChain* pSwapChain, UINT BufferCount, UINT Width, UINT Height, DXGI_FORMAT NewFormat, UINT SwapChainFlags)
+{
+    ReleaseMainRenderTarget();
+
+    HRESULT hr = OriginalResizeBuffers(pSwapChain, BufferCount, Width, Height, NewFormat, SwapChainFlags);
+
+    if (SUCCEEDED(hr) && g_ImGuiReady)
+        CreateMainRenderTarget(pSwapChain);
+
+    return hr;
+}
+
+static bool GetSwapChainAddresses(Present_t* presentAddr, ResizeBuffers_t* resizeBuffersAddr)
 {
     HWND dummyHwnd = FindWindowW(L"UnrealWindow", nullptr);
 
@@ -160,28 +201,38 @@ static Present_t GetPresentAddress()
     HRESULT hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, &featureLevel, 1, D3D11_SDK_VERSION, &scd, &tmpChain, &tmpDevice, nullptr, &tmpContext);
 
     if (FAILED(hr)) 
-        return nullptr;
+        return false;
 
     void** vtable = *reinterpret_cast<void***>(tmpChain);
-    Present_t addr = reinterpret_cast<Present_t>(vtable[8]);
+    if (presentAddr)
+        *presentAddr = reinterpret_cast<Present_t>(vtable[8]);
+
+    if (resizeBuffersAddr)
+        *resizeBuffersAddr = reinterpret_cast<ResizeBuffers_t>(vtable[13]);
 
     tmpChain->Release();
     tmpContext->Release();
     tmpDevice->Release();
 
-    return addr;
+    return true;
 }
 
 static void InstallDXHook()
 {
-    Present_t presentAddr = GetPresentAddress();
+    Present_t presentAddr = nullptr;
+    ResizeBuffers_t resizeBuffersAddr = nullptr;
 
-    if (!presentAddr) 
+    if (!GetSwapChainAddresses(&presentAddr, &resizeBuffersAddr) || !presentAddr || !resizeBuffersAddr)
         return;
 
-    MH_Initialize();
+    MH_STATUS initStatus = MH_Initialize();
+    if (initStatus != MH_OK && initStatus != MH_ERROR_ALREADY_INITIALIZED)
+        return;
+
     MH_CreateHook(reinterpret_cast<void*>(presentAddr), reinterpret_cast<void*>(HookedPresent), reinterpret_cast<void**>(&OriginalPresent));
+    MH_CreateHook(reinterpret_cast<void*>(resizeBuffersAddr), reinterpret_cast<void*>(HookedResizeBuffers), reinterpret_cast<void**>(&OriginalResizeBuffers));
     MH_EnableHook(reinterpret_cast<void*>(presentAddr));
+    MH_EnableHook(reinterpret_cast<void*>(resizeBuffersAddr));
 }
 
 void ForceIris(uintptr_t IrisBool)
