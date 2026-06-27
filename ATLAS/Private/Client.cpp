@@ -14,7 +14,7 @@ void* SelectEdit(void* a1)
 {
 	void* result = SelectEditOG(a1);
 
-	if (FConfiguration::bEOREnabled)
+	if (FConfiguration::bEOREnabled && CompleteBuildingEditInteraction)
 		CompleteBuildingEditInteraction(a1);
 
 	return result;
@@ -24,7 +24,7 @@ void* SelectReset(void* a1)
 {
 	void* result = SelectResetOG(a1);
 
-	if (FConfiguration::bROREnabled)
+	if (FConfiguration::bROREnabled && CompleteBuildingEditInteraction)
 		CompleteBuildingEditInteraction(a1);
 
 	return result;
@@ -32,7 +32,7 @@ void* SelectReset(void* a1)
 
 void PerformBuildingEditInteraction(AFortPlayerControllerAthena* _this)
 {
-	if (FConfiguration::bDisablePreEdits && _this->TargetedBuilding->IsA<ABuildingPlayerPrimitivePreview>())
+	if (FConfiguration::bDisablePreEdits && _this && _this->TargetedBuilding && _this->TargetedBuilding->IsA<ABuildingPlayerPrimitivePreview>())
 		return;
 
 	return PerformBuildingEditInteractionOG(_this);
@@ -187,81 +187,95 @@ void Client::Init()
 	if (VersionInfo.FortniteVersion < 24.30)
 	{
 		auto CompRef = Memcury::Scanner::FindStringRef(L"EditModeInputComponent0").Get();
-		uintptr_t SelectEditAddr, SelectResetAddr, PerformBuildingEditInteractionAddr;
+		uintptr_t SelectEditAddr = 0, SelectResetAddr = 0, PerformBuildingEditInteractionAddr = 0;
 
-		int Skip = 0;
-		for (int i = 1; i < 2000; i++)
+		if (CompRef)
 		{
-			if (*(uint8_t*)(CompRef + i) == 0x48 && *(uint8_t*)(CompRef + i + 1) == 0x8D && *(uint8_t*)(CompRef + i + 2) == 0x05)
+			int Skip = 0;
+			for (int i = 1; i < 2000; i++)
 			{
-				if (Skip == 1)
-					SelectEditAddr = Memcury::Scanner(CompRef + i).RelativeOffset(3).Get();
-				else if (Skip == 2)
+				if (*(uint8_t*)(CompRef + i) == 0x48 && *(uint8_t*)(CompRef + i + 1) == 0x8D && *(uint8_t*)(CompRef + i + 2) == 0x05)
 				{
-					SelectResetAddr = Memcury::Scanner(CompRef + i).RelativeOffset(3).Get();
-					break;
-				}
+					if (Skip == 1)
+						SelectEditAddr = Memcury::Scanner(CompRef + i).RelativeOffset(3).Get();
+					else if (Skip == 2)
+					{
+						SelectResetAddr = Memcury::Scanner(CompRef + i).RelativeOffset(3).Get();
+						break;
+					}
 
-				Skip++;
+					Skip++;
+				}
 			}
 		}
 		
 		auto rdataSect = Memcury::PE::Section::GetSection(".rdata");
-		for (int i = 1; i < 0x5000; i++)
+		if (CompRef)
 		{
-			if ((*(uint8_t*)(CompRef - i) == 0x48 || *(uint8_t*)(CompRef - i) == 0x4C) && *(uint8_t*)(CompRef - i + 1) == 0x8D)
+			for (int i = 1; i < 0x5000; i++)
 			{
-				auto stringAddr = Memcury::Scanner(CompRef - i).RelativeOffset(3).Get();
-
-				if (rdataSect.isInSection(stringAddr))
+				if ((*(uint8_t*)(CompRef - i) == 0x48 || *(uint8_t*)(CompRef - i) == 0x4C) && *(uint8_t*)(CompRef - i + 1) == 0x8D)
 				{
-					auto str = (char*)stringAddr;
+					auto stringAddr = Memcury::Scanner(CompRef - i).RelativeOffset(3).Get();
 
-					if (strcmp(str, "PerformBuildingEditInteraction") == 0)
+					if (rdataSect.isInSection(stringAddr))
 					{
-						for (int x = 1; x < 2000; x++)
+						auto str = (char*)stringAddr;
+
+						if (strcmp(str, "PerformBuildingEditInteraction") == 0)
 						{
-							if (*(uint8_t*)(CompRef - i - x) == 0x48 && *(uint8_t*)(CompRef - i - x + 1) == 0x8D && *(uint8_t*)(CompRef - i - x + 2) == 0x05)
+							for (int x = 1; x < 2000; x++)
 							{
-								PerformBuildingEditInteractionAddr = Memcury::Scanner(CompRef - i - x).RelativeOffset(3).Get();
-								break;
+								if (*(uint8_t*)(CompRef - i - x) == 0x48 && *(uint8_t*)(CompRef - i - x + 1) == 0x8D && *(uint8_t*)(CompRef - i - x + 2) == 0x05)
+								{
+									PerformBuildingEditInteractionAddr = Memcury::Scanner(CompRef - i - x).RelativeOffset(3).Get();
+									break;
+								}
 							}
+							break;
 						}
+					}
+				}
+			}
+		}
+
+		auto textSect = Memcury::PE::Section::GetSection(".text");
+		auto sRef = Memcury::Scanner::FindStringRef("CompleteBuildingEditInteraction").Get();
+		uintptr_t CompleteBuildingEditInteractionLea = 0;
+
+		if (sRef)
+		{
+			for (int i = 1; i < 2000; i++)
+			{
+				const uint8_t Prefix = *(uint8_t*)(sRef - i);
+				const uint8_t Op = *(uint8_t*)(sRef - i + 1);
+				const uint8_t ModRM = *(uint8_t*)(sRef - i + 2);
+
+				if ((Prefix == 0x48 || Prefix == 0x4C) && Op == 0x8D && (ModRM & 0xC7) == 0x05)
+				{
+					auto Addr = Memcury::Scanner(sRef - i).RelativeOffset(3).Get();
+					if (textSect.isInSection(Addr))
+					{
+						CompleteBuildingEditInteractionLea = sRef - i;
 						break;
 					}
 				}
 			}
 		}
 
-		auto sRef = Memcury::Scanner::FindStringRef("CompleteBuildingEditInteraction", true, VersionInfo.EngineVersion >= 4.27).Get();
-		uintptr_t CompleteBuildingEditInteractionLea = 0;
-
-		for (int i = 1; i < 2000; i++)
-		{
-			if (*(uint8_t*)(sRef - i) == 0x4C && *(uint8_t*)(sRef - i + 1) == 0x8D)
-			{
-				CompleteBuildingEditInteractionLea = sRef - i;
-				break;
-			}
-			else if (*(uint8_t*)(sRef - i) == 0x48 && *(uint8_t*)(sRef - i + 1) == 0x8D)
-			{
-				CompleteBuildingEditInteractionLea = sRef - i;
-				break;
-			}
-		}
-
-		CompleteBuildingEditInteraction = (void (*)(void*)) Memcury::Scanner(CompleteBuildingEditInteractionLea).RelativeOffset(3).Get();
+		if (CompleteBuildingEditInteractionLea)
+			CompleteBuildingEditInteraction = (void (*)(void*)) Memcury::Scanner(CompleteBuildingEditInteractionLea).RelativeOffset(3).Get();
 
 		if (MH_Initialize() == MH_ERROR_ALREADY_INITIALIZED) 
 		{ 
 			/* already set up, skip */ 
 		}
 
-		if (VersionInfo.FortniteVersion < 11)
+		if (VersionInfo.FortniteVersion < 11 && SelectEditAddr && CompleteBuildingEditInteraction)
 			Utils::Hook(SelectEditAddr, SelectEdit, SelectEditOG);
-		if (VersionInfo.FortniteVersion < 15.20)
+		if (VersionInfo.FortniteVersion < 15.20 && PerformBuildingEditInteractionAddr)
 			Utils::Hook(PerformBuildingEditInteractionAddr, PerformBuildingEditInteraction, PerformBuildingEditInteractionOG);
-		if (VersionInfo.FortniteVersion < 24.30)
+		if (VersionInfo.FortniteVersion < 24.30 && SelectResetAddr && CompleteBuildingEditInteraction)
 			Utils::Hook(SelectResetAddr, SelectReset, SelectResetOG);
 
 		MH_EnableHook(MH_ALL_HOOKS);
