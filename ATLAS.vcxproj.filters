@@ -87,6 +87,9 @@
     <ClInclude Include="ATLAS\ImGui\imgui_impl_dx11.h">
       <Filter>ATLAS\ImGui</Filter>
     </ClInclude>
+    <ClInclude Include="ATLAS\ImGui\imgui_impl_dx12.h">
+      <Filter>ATLAS\ImGui</Filter>
+    </ClInclude>
     <ClInclude Include="ATLAS\ImGui\imgui_impl_win32.h">
       <Filter>ATLAS\ImGui</Filter>
     </ClInclude>
@@ -141,6 +144,9 @@
       <Filter>ATLAS\ImGui</Filter>
     </ClCompile>
     <ClCompile Include="ATLAS\ImGui\imgui_impl_dx11.cpp">
+      <Filter>ATLAS\ImGui</Filter>
+    </ClCompile>
+    <ClCompile Include="ATLAS\ImGui\imgui_impl_dx12.cpp">
       <Filter>ATLAS\ImGui</Filter>
     </ClCompile>
     <ClCompile Include="ATLAS\ImGui\imgui_impl_win32.cpp">

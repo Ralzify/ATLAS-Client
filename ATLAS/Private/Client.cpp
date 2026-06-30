@@ -10,12 +10,97 @@ inline void* (*SelectEditOG)(void*) = nullptr;
 inline void (*PerformBuildingEditInteractionOG)(void*) = nullptr;
 inline void (*CompleteBuildingEditInteraction)(void*) = nullptr;
 
+static AFortPlayerControllerAthena* GetLocalFortPlayerController()
+{
+	auto World = UWorld::GetWorld();
+	if (!World || !World->OwningGameInstance)
+		return nullptr;
+
+	auto& LocalPlayers = World->OwningGameInstance->LocalPlayers;
+	if (LocalPlayers.Num() <= 0 || !LocalPlayers[0])
+		return nullptr;
+
+	return (AFortPlayerControllerAthena*)LocalPlayers[0]->PlayerController;
+}
+
+static void SafeCompleteBuildingEditInteraction()
+{
+	if (!CompleteBuildingEditInteraction)
+		return;
+
+	auto PlayerController = GetLocalFortPlayerController();
+	if (!PlayerController)
+		return;
+
+	__try
+	{
+		CompleteBuildingEditInteraction(PlayerController);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		CompleteBuildingEditInteraction = nullptr;
+	}
+}
+
+static uintptr_t FindTextLeaTargetNear(uintptr_t Center, int Before, int After)
+{
+	auto TextSect = Memcury::PE::Section::GetSection(".text");
+
+	auto TryInstruction = [&](uintptr_t Addr) -> uintptr_t
+	{
+		if (!TextSect.isInSection(Addr))
+			return 0;
+
+		const uint8_t Prefix = *(uint8_t*)Addr;
+		const uint8_t Op = *(uint8_t*)(Addr + 1);
+		const uint8_t ModRM = *(uint8_t*)(Addr + 2);
+
+		if ((Prefix == 0x48 || Prefix == 0x4C) && Op == 0x8D && (ModRM & 0xC7) == 0x05)
+		{
+			auto Target = Memcury::Scanner(Addr).RelativeOffset(3).Get();
+			if (TextSect.isInSection(Target))
+				return Target;
+		}
+
+		return 0;
+	};
+
+	for (int i = 1; i <= Before; i++)
+	{
+		if (auto Target = TryInstruction(Center - i))
+			return Target;
+	}
+
+	for (int i = 0; i <= After; i++)
+	{
+		if (auto Target = TryInstruction(Center + i))
+			return Target;
+	}
+
+	return 0;
+}
+
+static uintptr_t FindCompleteBuildingEditInteraction()
+{
+	for (int RefIndex = 0; RefIndex < 4; RefIndex++)
+	{
+		auto StringRef = Memcury::Scanner::FindStringRef("CompleteBuildingEditInteraction", false, RefIndex).Get();
+		if (!StringRef)
+			break;
+
+		if (auto Target = FindTextLeaTargetNear(StringRef, 2000, 256))
+			return Target;
+	}
+
+	return 0;
+}
+
 void* SelectEdit(void* a1)
 {
 	void* result = SelectEditOG(a1);
 
-	if (FConfiguration::bEOREnabled && CompleteBuildingEditInteraction)
-		CompleteBuildingEditInteraction(a1);
+	if (FConfiguration::bEOREnabled)
+		SafeCompleteBuildingEditInteraction();
 
 	return result;
 }
@@ -24,8 +109,8 @@ void* SelectReset(void* a1)
 {
 	void* result = SelectResetOG(a1);
 
-	if (FConfiguration::bROREnabled && CompleteBuildingEditInteraction)
-		CompleteBuildingEditInteraction(a1);
+	if (FConfiguration::bROREnabled)
+		SafeCompleteBuildingEditInteraction();
 
 	return result;
 }
@@ -160,13 +245,13 @@ void Client::Init()
 					{
 						Playlist->RespawnHeight.Curve.CurveTable = nullptr;
 						Playlist->RespawnHeight.Curve.RowName = FName();
-						Playlist->RespawnHeight.Value = FConfiguration::RespawnHeight;
+						Playlist->RespawnHeight.Value = (float)FConfiguration::RespawnHeight;
 					}
 					if (Playlist->HasRespawnTime())
 					{
 						Playlist->RespawnTime.Curve.CurveTable = nullptr;
 						Playlist->RespawnTime.Curve.RowName = FName();
-						Playlist->RespawnTime.Value = FConfiguration::RespawnTime;
+						Playlist->RespawnTime.Value = (float)FConfiguration::RespawnTime;
 					}
 					Playlist->RespawnType = 1; // InfiniteRespawns
 					if (Playlist->HasbAllowJoinInProgress())
@@ -239,32 +324,8 @@ void Client::Init()
 			}
 		}
 
-		auto textSect = Memcury::PE::Section::GetSection(".text");
-		auto sRef = Memcury::Scanner::FindStringRef("CompleteBuildingEditInteraction").Get();
-		uintptr_t CompleteBuildingEditInteractionLea = 0;
-
-		if (sRef)
-		{
-			for (int i = 1; i < 2000; i++)
-			{
-				const uint8_t Prefix = *(uint8_t*)(sRef - i);
-				const uint8_t Op = *(uint8_t*)(sRef - i + 1);
-				const uint8_t ModRM = *(uint8_t*)(sRef - i + 2);
-
-				if ((Prefix == 0x48 || Prefix == 0x4C) && Op == 0x8D && (ModRM & 0xC7) == 0x05)
-				{
-					auto Addr = Memcury::Scanner(sRef - i).RelativeOffset(3).Get();
-					if (textSect.isInSection(Addr))
-					{
-						CompleteBuildingEditInteractionLea = sRef - i;
-						break;
-					}
-				}
-			}
-		}
-
-		if (CompleteBuildingEditInteractionLea)
-			CompleteBuildingEditInteraction = (void (*)(void*)) Memcury::Scanner(CompleteBuildingEditInteractionLea).RelativeOffset(3).Get();
+		if (auto CompleteBuildingEditInteractionAddr = FindCompleteBuildingEditInteraction())
+			CompleteBuildingEditInteraction = (void (*)(void*))CompleteBuildingEditInteractionAddr;
 
 		if (MH_Initialize() == MH_ERROR_ALREADY_INITIALIZED) 
 		{ 

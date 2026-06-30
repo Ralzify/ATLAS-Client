@@ -8,6 +8,7 @@
 
 #include <sstream>
 #include <iomanip>
+#include <vector>
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_ONLY_PNG
@@ -30,6 +31,11 @@ static const char* VKName(int vk)
 
     switch (vk)
     {
+    case VK_LBUTTON: return "MOUSE1";
+    case VK_RBUTTON: return "MOUSE2";
+    case VK_MBUTTON: return "MOUSE3";
+    case VK_XBUTTON1: return "MOUSE4";
+    case VK_XBUTTON2: return "MOUSE5";
     case VK_F1:  return "F1";  case VK_F2:  return "F2";
     case VK_F3:  return "F3";  case VK_F4:  return "F4";
     case VK_F5:  return "F5";  case VK_F6:  return "F6";
@@ -66,11 +72,32 @@ static const char* VKName(int vk)
     return buf;
 }
 
+static const char* BindName(int vk)
+{
+    return (vk > 0 && vk <= 254) ? VKName(vk) : "UNBOUND";
+}
+
 void FGUI::SaveHotkey() { HotkeyPersist::Save(FGUI::HotkeyVK); }
 void FGUI::LoadHotkey() { FGUI::HotkeyVK = HotkeyPersist::Load(VK_F9); }
 
 void FGUI::SaveJoinHotkey() { HotkeyPersist::Save(FGUI::JoinHotkeyVK, "joinHotkey"); }
 void FGUI::LoadJoinHotkey() { FGUI::JoinHotkeyVK = HotkeyPersist::Load(VK_F5, "joinHotkey"); }
+
+void FGUI::SaveCommands() { HotkeyPersist::SaveCommands(FGUI::Commands); }
+void FGUI::LoadCommands() { FGUI::Commands = HotkeyPersist::LoadCommands(); }
+void FGUI::ResetAll()
+{
+    FGUI::HotkeyVK = VK_F9;
+    FGUI::JoinHotkeyVK = VK_F5;
+    FGUI::bRebinding = false;
+    FGUI::bRebindingJoin = false;
+    FGUI::RebindingCommandIndex = -2;
+    FGUI::PendingCommandVK = 0;
+    FGUI::CommandInput[0] = '\0';
+    FGUI::Commands.clear();
+
+    HotkeyPersist::SaveAll(FGUI::HotkeyVK, FGUI::JoinHotkeyVK, {});
+}
 
 void GUI_LoadTextures(ID3D11Device* device)
 {
@@ -103,9 +130,11 @@ void GUI_LoadTextures(ID3D11Device* device)
         srvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
         srvDesc.Texture2D.MipLevels = (UINT)-1;
-        if (SUCCEEDED(device->CreateShaderResourceView(tex, &srvDesc, &FGUI::LogoTexture)))
+        ID3D11ShaderResourceView* srv = nullptr;
+        if (SUCCEEDED(device->CreateShaderResourceView(tex, &srvDesc, &srv)))
         {
-            ctx->GenerateMips(FGUI::LogoTexture);
+            FGUI::LogoTexture = (ImTextureID)srv;
+            ctx->GenerateMips(srv);
             FGUI::LogoW = w;
             FGUI::LogoH = h;
         }
@@ -115,6 +144,252 @@ void GUI_LoadTextures(ID3D11Device* device)
     }
 
     stbi_image_free(pixels);
+}
+
+static ID3D12Resource* g_LogoTextureDX12 = nullptr;
+
+struct LogoMipLevel
+{
+    UINT Width = 0;
+    UINT Height = 0;
+    std::vector<uint8_t> Pixels;
+};
+
+static std::vector<LogoMipLevel> BuildLogoMipChain(const unsigned char* pixels, UINT width, UINT height)
+{
+    std::vector<LogoMipLevel> mips;
+    if (!pixels || !width || !height)
+        return mips;
+
+    LogoMipLevel base{};
+    base.Width = width;
+    base.Height = height;
+    base.Pixels.assign(pixels, pixels + (size_t)width * height * 4);
+    mips.push_back(std::move(base));
+
+    while (mips.back().Width > 1 || mips.back().Height > 1)
+    {
+        const LogoMipLevel& src = mips.back();
+        LogoMipLevel dst{};
+        dst.Width = src.Width > 1 ? src.Width / 2 : 1;
+        dst.Height = src.Height > 1 ? src.Height / 2 : 1;
+        dst.Pixels.resize((size_t)dst.Width * dst.Height * 4);
+
+        for (UINT y = 0; y < dst.Height; y++)
+        {
+            for (UINT x = 0; x < dst.Width; x++)
+            {
+                UINT r = 0, g = 0, b = 0, a = 0;
+                for (UINT oy = 0; oy < 2; oy++)
+                {
+                    const UINT sy = min(src.Height - 1, y * 2 + oy);
+                    for (UINT ox = 0; ox < 2; ox++)
+                    {
+                        const UINT sx = min(src.Width - 1, x * 2 + ox);
+                        const uint8_t* p = &src.Pixels[((size_t)sy * src.Width + sx) * 4];
+                        const UINT alpha = p[3];
+                        r += p[0] * alpha;
+                        g += p[1] * alpha;
+                        b += p[2] * alpha;
+                        a += alpha;
+                    }
+                }
+
+                uint8_t* out = &dst.Pixels[((size_t)y * dst.Width + x) * 4];
+                out[3] = (uint8_t)(a / 4);
+                if (a > 0)
+                {
+                    out[0] = (uint8_t)(r / a);
+                    out[1] = (uint8_t)(g / a);
+                    out[2] = (uint8_t)(b / a);
+                }
+                else
+                {
+                    out[0] = out[1] = out[2] = 0;
+                }
+            }
+        }
+
+        mips.push_back(std::move(dst));
+    }
+
+    return mips;
+}
+
+void GUI_LoadTexturesDX12(ID3D12Device* device, ID3D12CommandQueue* commandQueue, D3D12_CPU_DESCRIPTOR_HANDLE srvCpu, D3D12_GPU_DESCRIPTOR_HANDLE srvGpu)
+{
+    if (!device || !commandQueue || !srvCpu.ptr || !srvGpu.ptr)
+        return;
+
+    int w, h, ch;
+    unsigned char* pixels = stbi_load_from_memory(Icon, (int)sizeof(Icon), &w, &h, &ch, 4);
+    if (!pixels)
+        return;
+
+    std::vector<LogoMipLevel> mips = BuildLogoMipChain(pixels, (UINT)w, (UINT)h);
+    stbi_image_free(pixels);
+    if (mips.empty())
+        return;
+
+    if (g_LogoTextureDX12)
+    {
+        g_LogoTextureDX12->Release();
+        g_LogoTextureDX12 = nullptr;
+    }
+
+    D3D12_RESOURCE_DESC texDesc{};
+    texDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    texDesc.Width = (UINT64)w;
+    texDesc.Height = (UINT)h;
+    texDesc.DepthOrArraySize = 1;
+    texDesc.MipLevels = (UINT16)mips.size();
+    texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    texDesc.SampleDesc.Count = 1;
+    texDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+    D3D12_HEAP_PROPERTIES defaultHeap{};
+    defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    HRESULT hr = device->CreateCommittedResource(
+        &defaultHeap,
+        D3D12_HEAP_FLAG_NONE,
+        &texDesc,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+        nullptr,
+        IID_PPV_ARGS(&g_LogoTextureDX12));
+
+    if (FAILED(hr))
+    {
+        return;
+    }
+
+    UINT64 uploadSize = 0;
+    const UINT mipCount = (UINT)mips.size();
+    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints(mipCount);
+    std::vector<UINT> numRows(mipCount);
+    std::vector<UINT64> rowSizeInBytes(mipCount);
+    device->GetCopyableFootprints(&texDesc, 0, mipCount, 0, footprints.data(), numRows.data(), rowSizeInBytes.data(), &uploadSize);
+
+    D3D12_HEAP_PROPERTIES uploadHeap{};
+    uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+
+    D3D12_RESOURCE_DESC uploadDesc{};
+    uploadDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    uploadDesc.Width = uploadSize;
+    uploadDesc.Height = 1;
+    uploadDesc.DepthOrArraySize = 1;
+    uploadDesc.MipLevels = 1;
+    uploadDesc.SampleDesc.Count = 1;
+    uploadDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    ID3D12Resource* uploadBuffer = nullptr;
+    hr = device->CreateCommittedResource(
+        &uploadHeap,
+        D3D12_HEAP_FLAG_NONE,
+        &uploadDesc,
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+        nullptr,
+        IID_PPV_ARGS(&uploadBuffer));
+
+    if (FAILED(hr))
+    {
+        g_LogoTextureDX12->Release();
+        g_LogoTextureDX12 = nullptr;
+        return;
+    }
+
+    uint8_t* mapped = nullptr;
+    D3D12_RANGE readRange{};
+    if (FAILED(uploadBuffer->Map(0, &readRange, (void**)&mapped)))
+    {
+        uploadBuffer->Release();
+        g_LogoTextureDX12->Release();
+        g_LogoTextureDX12 = nullptr;
+        return;
+    }
+
+    for (UINT mip = 0; mip < mipCount; mip++)
+    {
+        const LogoMipLevel& level = mips[mip];
+        const UINT srcPitch = level.Width * 4;
+        uint8_t* dst = mapped + footprints[mip].Offset;
+        for (UINT row = 0; row < level.Height; row++)
+            memcpy(dst + row * footprints[mip].Footprint.RowPitch, level.Pixels.data() + (size_t)row * srcPitch, srcPitch);
+    }
+
+    uploadBuffer->Unmap(0, nullptr);
+
+    ID3D12CommandAllocator* allocator = nullptr;
+    ID3D12GraphicsCommandList* commandList = nullptr;
+    ID3D12Fence* fence = nullptr;
+    HANDLE fenceEvent = nullptr;
+
+    hr = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator));
+    if (SUCCEEDED(hr))
+        hr = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, nullptr, IID_PPV_ARGS(&commandList));
+    if (SUCCEEDED(hr))
+        hr = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+    if (SUCCEEDED(hr))
+        fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+
+    if (FAILED(hr) || !fenceEvent)
+    {
+        if (fenceEvent) CloseHandle(fenceEvent);
+        if (fence) fence->Release();
+        if (commandList) commandList->Release();
+        if (allocator) allocator->Release();
+        uploadBuffer->Release();
+        g_LogoTextureDX12->Release();
+        g_LogoTextureDX12 = nullptr;
+        return;
+    }
+
+    for (UINT mip = 0; mip < mipCount; mip++)
+    {
+        D3D12_TEXTURE_COPY_LOCATION src{};
+        src.pResource = uploadBuffer;
+        src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        src.PlacedFootprint = footprints[mip];
+
+        D3D12_TEXTURE_COPY_LOCATION dst{};
+        dst.pResource = g_LogoTextureDX12;
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst.SubresourceIndex = mip;
+
+        commandList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    }
+
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = g_LogoTextureDX12;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    commandList->ResourceBarrier(1, &barrier);
+
+    commandList->Close();
+    ID3D12CommandList* lists[] = { commandList };
+    commandQueue->ExecuteCommandLists(1, lists);
+    commandQueue->Signal(fence, 1);
+    if (fence->GetCompletedValue() < 1 && SUCCEEDED(fence->SetEventOnCompletion(1, fenceEvent)))
+        WaitForSingleObject(fenceEvent, INFINITE);
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+    srvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srvDesc.Texture2D.MipLevels = mipCount;
+    srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    device->CreateShaderResourceView(g_LogoTextureDX12, &srvDesc, srvCpu);
+
+    FGUI::LogoTexture = (ImTextureID)srvGpu.ptr;
+    FGUI::LogoW = w;
+    FGUI::LogoH = h;
+
+    CloseHandle(fenceEvent);
+    fence->Release();
+    commandList->Release();
+    allocator->Release();
+    uploadBuffer->Release();
 }
 
 static void PushStyle()
@@ -127,18 +402,18 @@ static void PushStyle()
 
     s.WindowRounding = 8.f;
     s.ChildRounding = 6.f;
-    s.FrameRounding = 4.f;
-    s.GrabRounding = 4.f;
+    s.FrameRounding = 4.5f;
+    s.GrabRounding = 16.f;
     s.PopupRounding = 4.f;
-    s.ScrollbarRounding = 4.f;
+    s.ScrollbarRounding = 16.f;
     s.TabRounding = 4.f;
     s.WindowPadding = { 16.f, 14.f };
     s.FramePadding = { 10.f,  5.f };
     s.ItemSpacing = { 8.f,  7.f };
     s.ItemInnerSpacing = { 6.f,  4.f };
     s.IndentSpacing = 18.f;
-    s.ScrollbarSize = 4.f;
-    s.GrabMinSize = 10.f;
+    s.ScrollbarSize = 18.f;
+    s.GrabMinSize = 14.f;
     s.WindowBorderSize = 1.f;
     s.FrameBorderSize = 0.f;
 
@@ -314,6 +589,7 @@ void GUI_Init()
 {
     FGUI::LoadHotkey();
     FGUI::LoadJoinHotkey();
+    FGUI::LoadCommands();
     PushStyle();
 }
 
@@ -321,6 +597,7 @@ static bool IsBindableVK(int vk)
 {
     switch (vk)
     {
+    case VK_CANCEL:
     case VK_ESCAPE:
     case VK_SHIFT: case VK_CONTROL: case VK_MENU:
     case VK_LSHIFT: case VK_RSHIFT:
@@ -332,20 +609,57 @@ static bool IsBindableVK(int vk)
     return true;
 }
 
+static bool g_WaitingForBindRelease = false;
+
+static void BeginBindCapture()
+{
+    g_WaitingForBindRelease = true;
+
+    for (int vk = 0x01; vk <= 0xFE; vk++)
+        if (IsBindableVK(vk))
+            GetAsyncKeyState(vk);
+}
+
+static void EndBindCapture()
+{
+    g_WaitingForBindRelease = false;
+}
+
+static bool AnyBindableInputDown()
+{
+    for (int vk = 0x01; vk <= 0xFE; vk++)
+        if (IsBindableVK(vk) && (GetAsyncKeyState(vk) & 0x8000))
+            return true;
+
+    return false;
+}
+
 static int PollBindKey()
 {
-    for (int vk = 0x08; vk <= 0xFE; vk++)
-        if (IsBindableVK(vk) && (GetAsyncKeyState(vk) & 1))
+    if (g_WaitingForBindRelease)
+    {
+        if (AnyBindableInputDown())
+            return 0;
+
+        g_WaitingForBindRelease = false;
+        return 0;
+    }
+
+    for (int vk = 0x01; vk <= 0xFE; vk++)
+        if (IsBindableVK(vk) && (GetAsyncKeyState(vk) & 0x8000))
             return vk;
+
     return 0;
 }
 
 void GUI_HandleInput()
 {
-    if ((FGUI::bRebinding || FGUI::bRebindingJoin) && (GetAsyncKeyState(VK_ESCAPE) & 1))
+    if ((FGUI::bRebinding || FGUI::bRebindingJoin || FGUI::RebindingCommandIndex != -2) && (GetAsyncKeyState(VK_ESCAPE) & 1))
     {
         FGUI::bRebinding = false;
         FGUI::bRebindingJoin = false;
+        FGUI::RebindingCommandIndex = -2;
+        EndBindCapture();
         return;
     }
 
@@ -356,6 +670,7 @@ void GUI_HandleInput()
             FGUI::HotkeyVK = vk;
             FGUI::bRebinding = false;
             FGUI::SaveHotkey();
+            EndBindCapture();
         }
         return;
     }
@@ -367,6 +682,27 @@ void GUI_HandleInput()
             FGUI::JoinHotkeyVK = vk;
             FGUI::bRebindingJoin = false;
             FGUI::SaveJoinHotkey();
+            EndBindCapture();
+        }
+        return;
+    }
+
+    if (FGUI::RebindingCommandIndex != -2)
+    {
+        if (int vk = PollBindKey())
+        {
+            if (FGUI::RebindingCommandIndex == -1)
+            {
+                FGUI::PendingCommandVK = vk;
+            }
+            else if (FGUI::RebindingCommandIndex >= 0 && FGUI::RebindingCommandIndex < (int)FGUI::Commands.size())
+            {
+                FGUI::Commands[FGUI::RebindingCommandIndex].VK = vk;
+                FGUI::SaveCommands();
+            }
+
+            FGUI::RebindingCommandIndex = -2;
+            EndBindCapture();
         }
         return;
     }
@@ -376,6 +712,15 @@ void GUI_HandleInput()
 
     if (GetAsyncKeyState(FGUI::JoinHotkeyVK) & 1)
         JoinSelectedHost();
+
+    if (!FGUI::bVisible)
+    {
+        for (const auto& command : FGUI::Commands)
+        {
+            if (command.VK > 0 && command.VK <= 254 && (GetAsyncKeyState(command.VK) & 1))
+                Exec(command.Command.c_str());
+        }
+    }
 }
 
 void GUI_Render()
@@ -425,8 +770,8 @@ void GUI_Render()
         const float PadL = 14.f;
 
         ImGui::SetCursorPos(ImVec2(PadL, (TopBarH - LogoSize) * 0.5f));
-        if (FGUI::LogoTexture)
-            ImGui::Image((ImTextureID)FGUI::LogoTexture, ImVec2(LogoSize, LogoSize));
+        if (FGUI::LogoTexture != ImTextureID_Invalid)
+            ImGui::Image(FGUI::LogoTexture, ImVec2(LogoSize, LogoSize));
         else
             ImGui::Dummy(ImVec2(LogoSize, LogoSize));
 
@@ -487,7 +832,7 @@ void GUI_Render()
         fdl->AddLine(ImVec2(wp.x + SidebarW, wp.y + TopBarH), ImVec2(wp.x + SidebarW, wp.y + H), line, 1.f);
     }
 
-    static const char* kTabs[] = { "Main", "Config" };
+    static const char* kTabs[] = { "Main", "Commands", "Config" };
     const int kTabCount = (int)(sizeof(kTabs) / sizeof(kTabs[0]));
     const float TabH = 40.f;
     const float TabsTop = 12.f;
@@ -522,15 +867,22 @@ void GUI_Render()
 
     const float ContentPadX = 28.f;
     const float ContentPadTop = 12.f;
+    const bool bCommandsTab = FGUI::ActiveTab == 1;
+    const float ContentChildW = (W - SidebarW) - ContentPadX;
     ImGui::SetCursorPos(ImVec2(SidebarW + ContentPadX, TopBarH + ContentPadTop));
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.f, 0.f, 0.f, 0.f));
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, fade);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f, 0.f));
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.f, 10.f));
+    const ImGuiWindowFlags ContentFlags = bCommandsTab ? ImGuiWindowFlags_AlwaysVerticalScrollbar : ImGuiWindowFlags_None;
     ImGui::BeginChild("##content",
-        ImVec2((W - SidebarW) - ContentPadX * 2.f, (H - TopBarH) - ContentPadTop - 12.f), false);
+        ImVec2(ContentChildW, (H - TopBarH) - ContentPadTop - 12.f), false,
+        ContentFlags);
 
-    const float CW = ImGui::GetContentRegionAvail().x;
+    float CW = ImGui::GetContentRegionAvail().x;
+    CW -= ContentPadX;
+    if (CW < 1.f)
+        CW = ImGui::GetContentRegionAvail().x;
 
     switch (FGUI::ActiveTab)
     {
@@ -571,8 +923,8 @@ void GUI_Render()
     ImGui::TextWrapped("Pressing this key joins the currently selected host type.");
     ImGui::PopStyleColor();
 
-        if (VersionInfo.FortniteVersion < 24.30)
-        {
+    if (VersionInfo.EngineVersion < 4.24 || VersionInfo.FortniteVersion < 24.30)
+    {
         SectionLabel("Editing");
 
         if (VersionInfo.EngineVersion < 4.24)
@@ -594,111 +946,14 @@ void GUI_Render()
         }
 
         if (VersionInfo.FortniteVersion < 15.20)
-        {
             ImGui::Checkbox("Disable Pre-Edits", &FConfiguration::bDisablePreEdits);
-        }
-        }
-
-        SectionLabel("Respawn");
-
-        ImGui::Checkbox("Respawns Enabled", &FConfiguration::bForceRespawns);
-
-    if (FConfiguration::bForceRespawns)
-    {
-        //ImGui::Indent(16.f);
-
-        bool RespawnTimeEnabled = (FConfiguration::RespawnTime > 0);
-        bool RespawnHeightEnabled = (FConfiguration::RespawnHeight > 0);
-
-        const float RowStartX = ImGui::GetCursorPosX();
-        const float RowAvail = ImGui::GetContentRegionAvail().x;
-        const float LabelW = ImGui::CalcTextSize("Custom Respawn Height").x;
-        const float SliderX = RowStartX + ImGui::GetFrameHeight() + ImGui::GetStyle().ItemInnerSpacing.x + LabelW + 16.f;
-        float SliderW = (RowStartX + RowAvail) - SliderX - 42.f;
-        if (SliderW < 60.f) SliderW = 60.f;
-
-        if (ImGui::Checkbox("Custom Respawn Time", &RespawnTimeEnabled))
-            FConfiguration::RespawnTime = RespawnTimeEnabled ? 3 : 0;
-
-        if (RespawnTimeEnabled)
-        {
-            ImGui::SameLine();
-            ImGui::SetCursorPosX(SliderX);
-            ImGui::PushItemWidth(SliderW);
-            ImGui::SliderInt("##rtime", &FConfiguration::RespawnTime, 1, 30);
-            ImGui::PopItemWidth();
-            ImGui::SameLine();
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.353f, 0.388f, 0.478f, 1.f));
-            ImGui::Text("sec");
-            ImGui::PopStyleColor();
-        }
-
-        if (ImGui::Checkbox("Custom Respawn Height", &RespawnHeightEnabled))
-            FConfiguration::RespawnHeight = RespawnHeightEnabled ? 20000 : 0;
-
-        if (RespawnHeightEnabled)
-        {
-            ImGui::SameLine();
-            ImGui::SetCursorPosX(SliderX);
-            ImGui::PushItemWidth(SliderW);
-            ImGui::SliderInt("##rheight", &FConfiguration::RespawnHeight, 1000, 50000);
-            ImGui::PopItemWidth();
-            ImGui::SameLine();
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.353f, 0.388f, 0.478f, 1.f));
-            ImGui::Text("ue");
-            ImGui::PopStyleColor();
-        }
-
-        //ImGui::Unindent(16.f);
     }
 
-    SectionLabel("Console");
-
-    if (ImGui::Checkbox("Console Enabled", &FConfiguration::bConsoleEnabled))
+    SectionLabel("FOV");
     {
-        if (FConfiguration::bConsoleEnabled)
-            SpawnConsole();
-        else
-            DestroyConsole();
-    }
-
-    /*
-	// LOD bias
-    {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.847f, 0.878f, 0.941f, 1.f));
-        ImGui::Text("Potato Graphics");
-        ImGui::PopStyleColor();
-        ImGui::SameLine();
-        ImGui::PushItemWidth(180.f);
-
-        if (ImGui::SliderInt("##LODBias", &FConfiguration::LODBias, -3, 7))
-        {
-            std::ostringstream ss;
-            ss.imbue(std::locale::classic());
-            ss << "r.MipMapLODBias " << std::fixed << std::setprecision(1) << FConfiguration::LODBias;
-            std::string Command = ss.str();
-
-            auto Engine = UEngine::GetEngine();
-            if (Engine && Engine->GameViewport && Engine->GameViewport->ViewportConsole)
-            {
-                int len = MultiByteToWideChar(CP_UTF8, 0, Command.c_str(), -1, nullptr, 0);
-                std::wstring ws(len - 1, L'\0');
-                MultiByteToWideChar(CP_UTF8, 0, Command.c_str(), -1, ws.data(), len);
-
-                ((UConsole*)Engine->GameViewport->ViewportConsole)->ConsoleCommand(FString(ws.c_str()));
-            }
-        }
-
-        ImGui::PopItemWidth();
-    } */
-
-    // fov
-    {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.847f, 0.878f, 0.941f, 1.f));
-        ImGui::Text("FOV");
-        ImGui::PopStyleColor();
-        ImGui::SameLine();
-        ImGui::PushItemWidth(180.f);
+        const float ResetW = 110.f;
+        const float SliderW = CW - ResetW - ImGui::GetStyle().ItemSpacing.x;
+        ImGui::PushItemWidth(SliderW > 80.f ? SliderW : 80.f);
 
         if (ImGui::SliderInt("##fov", &FConfiguration::FOV, 1, 175))
         {
@@ -709,43 +964,152 @@ void GUI_Render()
 
         ImGui::PopItemWidth();
         ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.353f, 0.388f, 0.478f, 1.f));
-        ImGui::Text("%d\xc2\xb0", FConfiguration::FOV);
-        ImGui::PopStyleColor();
-    }
-
-	if (ImGui::Button("Reset FOV", ImVec2(100.f, 0.f)))
-    {
-        FConfiguration::FOV = 80;
-        Exec("fov");
-    }
-
-    /* {
-        const char* resItems[] = { "1920x1080", "1720x1080", "1280x720" };
-        const char* resCmds[] = { "setres 1920x1080", "setres 1720x1080", "setres 1280x720" };
-        ImGui::Text("Resolution");
-        ImGui::SameLine();
-        ImGui::PushItemWidth(140.f);
-        if (ImGui::BeginCombo("##res", resItems[FGUI::Resolution]))
+        if (ImGui::Button("Reset FOV", ImVec2(ResetW, 0.f)))
         {
-            for (int i = 0; i < 3; i++)
-            {
-                bool sel = (FGUI::Resolution == i);
-                if (ImGui::Selectable(resItems[i], sel))
-                {
-                    FGUI::Resolution = i;
-                    Exec(resCmds[i]);
-                }
-                if (sel) ImGui::SetItemDefaultFocus();
-            }
-            ImGui::EndCombo();
+            FConfiguration::FOV = 80;
+            Exec("fov");
         }
-        ImGui::PopItemWidth();
-    } */
+    }
+
+    SectionLabel("Respawn");
+    ImGui::Checkbox("Respawns Enabled", &FConfiguration::bForceRespawns);
+
+    SectionLabel("Console");
+    if (ImGui::Checkbox("Console Enabled", &FConfiguration::bConsoleEnabled))
+    {
+        if (FConfiguration::bConsoleEnabled)
+            SpawnConsole();
+        else
+            DestroyConsole();
+    }
 
         break;
     }
-    case 1: // Config
+    case 1: // Commands
+    {
+        SectionLabel("Commands");
+
+        ImGui::PushItemWidth(CW);
+        ImGui::InputTextWithHint("##commandinput", "UE Console Command", FGUI::CommandInput, sizeof(FGUI::CommandInput));
+        ImGui::PopItemWidth();
+
+        ImGui::Spacing();
+
+        char pendingBindLabel[64];
+        if (FGUI::RebindingCommandIndex == -1)
+            snprintf(pendingBindLabel, sizeof(pendingBindLabel), "Press any key...  (Esc to cancel)");
+        else
+            snprintf(pendingBindLabel, sizeof(pendingBindLabel), "Bind Key    [%s]", BindName(FGUI::PendingCommandVK));
+
+        const float AddButtonW = 110.f;
+        const float BindButtonW = CW - AddButtonW - ImGui::GetStyle().ItemSpacing.x;
+        if (ImGui::Button(pendingBindLabel, ImVec2(BindButtonW > 140.f ? BindButtonW : 140.f, 0.f)))
+        {
+            FGUI::RebindingCommandIndex = -1;
+            FGUI::bRebinding = false;
+            FGUI::bRebindingJoin = false;
+            BeginBindCapture();
+        }
+
+        ImGui::SameLine();
+
+        if (ImGui::Button("Save Command", ImVec2(AddButtonW, 0.f)))
+        {
+            const char* start = FGUI::CommandInput;
+            while (*start == ' ' || *start == '\t')
+                start++;
+
+            if (*start)
+            {
+                HotkeyPersist::CommandBind command{};
+                command.Command = start;
+                command.VK = (FGUI::PendingCommandVK > 0 && FGUI::PendingCommandVK <= 254) ? FGUI::PendingCommandVK : 0;
+                command.DefaultVK = command.VK;
+                FGUI::Commands.push_back(command);
+                FGUI::CommandInput[0] = '\0';
+                FGUI::PendingCommandVK = 0;
+                FGUI::RebindingCommandIndex = -2;
+                FGUI::SaveCommands();
+            }
+        }
+
+        ImGui::Spacing();
+        SectionLabel("Saved");
+
+        if (FGUI::Commands.empty())
+        {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.353f, 0.388f, 0.478f, 1.f));
+            ImGui::TextWrapped("No saved commands.");
+            ImGui::PopStyleColor();
+        }
+        else
+        {
+            for (int i = 0; i < (int)FGUI::Commands.size(); i++)
+            {
+                auto& command = FGUI::Commands[i];
+                ImGui::PushID(i);
+
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.847f, 0.878f, 0.941f, 1.f));
+                ImGui::TextWrapped("%s", command.Command.c_str());
+                ImGui::PopStyleColor();
+
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.353f, 0.388f, 0.478f, 1.f));
+                ImGui::Text("Key: %s", BindName(command.VK));
+                ImGui::PopStyleColor();
+
+                const float ButtonW = (CW - ImGui::GetStyle().ItemSpacing.x * 2.f) / 3.f;
+                if (ImGui::Button("Run", ImVec2(ButtonW, 0.f)))
+                    Exec(command.Command.c_str());
+                ImGui::SameLine();
+
+                char bindLabel[64];
+                if (FGUI::RebindingCommandIndex == i)
+                    snprintf(bindLabel, sizeof(bindLabel), "Press key...");
+                else if (command.VK > 0 && command.VK <= 254)
+                    snprintf(bindLabel, sizeof(bindLabel), "Unbind");
+                else
+                    snprintf(bindLabel, sizeof(bindLabel), "Bind");
+
+                if (ImGui::Button(bindLabel, ImVec2(ButtonW, 0.f)))
+                {
+                    if (FGUI::RebindingCommandIndex == i)
+                    {
+                        FGUI::RebindingCommandIndex = -2;
+                        EndBindCapture();
+                    }
+                    else if (command.VK > 0 && command.VK <= 254)
+                    {
+                        command.VK = 0;
+                        FGUI::RebindingCommandIndex = -2;
+                        FGUI::SaveCommands();
+                    }
+                    else
+                    {
+                        FGUI::RebindingCommandIndex = i;
+                        FGUI::bRebinding = false;
+                        FGUI::bRebindingJoin = false;
+                        BeginBindCapture();
+                    }
+                }
+                ImGui::SameLine();
+
+                if (ImGui::Button("Delete", ImVec2(ButtonW, 0.f)))
+                {
+                    FGUI::Commands.erase(FGUI::Commands.begin() + i);
+                    FGUI::RebindingCommandIndex = -2;
+                    FGUI::SaveCommands();
+                    ImGui::PopID();
+                    break;
+                }
+
+                ImGui::Separator();
+                ImGui::PopID();
+            }
+        }
+
+        break;
+    }
+    case 2: // Config
     {
     if (FGUI::bRebinding)
     {
@@ -762,6 +1126,8 @@ void GUI_Render()
         {
             FGUI::bRebinding = true;
             FGUI::bRebindingJoin = false;
+            FGUI::RebindingCommandIndex = -2;
+            BeginBindCapture();
         }
     }
 
@@ -780,12 +1146,20 @@ void GUI_Render()
         {
             FGUI::bRebindingJoin = true;
             FGUI::bRebinding = false;
+            FGUI::RebindingCommandIndex = -2;
+            BeginBindCapture();
         }
+    }
+
+    if (ImGui::Button("Reset All", ImVec2(CW, 0.f)))
+    {
+        EndBindCapture();
+        FGUI::ResetAll();
     }
 
     ImGui::Spacing();
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.353f, 0.388f, 0.478f, 1.f));
-    ImGui::TextWrapped("Hotkey is saved automatically and will persist across sessions.");
+    ImGui::TextWrapped("Hotkeys and command binds are saved automatically. Reset All restores default hotkeys and deletes saved commands.");
     ImGui::PopStyleColor();
 
         ImGui::Dummy(ImVec2(0.f, 8.f));

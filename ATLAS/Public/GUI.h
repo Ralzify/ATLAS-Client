@@ -2,12 +2,17 @@
 
 #include "../../SDK/Engine.h"
 #include "../Public/Configuration.h"
+#include "../Public/Hotkey.h"
+#include "../ImGui/imgui.h"
+#include <d3d12.h>
 #include <string>
+#include <vector>
 
 void GUI_Init();
 void GUI_Render();
 void GUI_HandleInput();
 void GUI_LoadTextures(ID3D11Device* device);
+void GUI_LoadTexturesDX12(ID3D12Device* device, ID3D12CommandQueue* commandQueue, D3D12_CPU_DESCRIPTOR_HANDLE srvCpu, D3D12_GPU_DESCRIPTOR_HANDLE srvGpu);
 
 struct FGUI
 {
@@ -20,7 +25,7 @@ struct FGUI
 
     // static inline int Resolution = 0;
 
-    static inline ID3D11ShaderResourceView* LogoTexture = nullptr;
+    static inline ImTextureID LogoTexture = ImTextureID_Invalid;
     static inline int LogoW = 0, LogoH = 0;
 
     static inline int HostType = 0; // 0 = Local Host, 1 = Remote Host
@@ -29,11 +34,20 @@ struct FGUI
     static inline int JoinHotkeyVK = VK_F5;
     static inline bool bRebindingJoin = false;
 
+    static inline std::vector<HotkeyPersist::CommandBind> Commands;
+    static inline char CommandInput[256] = "";
+    static inline int PendingCommandVK = 0;
+    static inline int RebindingCommandIndex = -2; // -1 = new command bind, >=0 = saved command, -2 = none
+
     static void SaveHotkey();
     static void LoadHotkey();
 
     static void SaveJoinHotkey();
     static void LoadJoinHotkey();
+
+    static void SaveCommands();
+    static void LoadCommands();
+    static void ResetAll();
 };
 
 // array size is 48672

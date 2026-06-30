@@ -22,6 +22,7 @@
     <ClInclude Include="ATLAS\ImGui\imconfig.h" />
     <ClInclude Include="ATLAS\ImGui\imgui.h" />
     <ClInclude Include="ATLAS\ImGui\imgui_impl_dx11.h" />
+    <ClInclude Include="ATLAS\ImGui\imgui_impl_dx12.h" />
     <ClInclude Include="ATLAS\ImGui\imgui_impl_win32.h" />
     <ClInclude Include="ATLAS\ImGui\imgui_internal.h" />
     <ClInclude Include="ATLAS\ImGui\imgui_stdlib.h" />
@@ -56,6 +57,7 @@
     <ClCompile Include="ATLAS\ImGui\imgui.cpp" />
     <ClCompile Include="ATLAS\ImGui\imgui_draw.cpp" />
     <ClCompile Include="ATLAS\ImGui\imgui_impl_dx11.cpp" />
+    <ClCompile Include="ATLAS\ImGui\imgui_impl_dx12.cpp" />
     <ClCompile Include="ATLAS\ImGui\imgui_impl_win32.cpp" />
     <ClCompile Include="ATLAS\ImGui\imgui_stdlib.cpp" />
     <ClCompile Include="ATLAS\ImGui\imgui_tables.cpp" />
@@ -190,7 +192,7 @@
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableUAC>false</EnableUAC>
-      <AdditionalDependencies>d3d11.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d3d11.lib;d3d12.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

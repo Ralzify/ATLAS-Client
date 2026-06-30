@@ -16,8 +16,11 @@ using namespace SDK;
 #include <algorithm>
 
 #include <d3d11.h>
+#include <d3d12.h>
 #include <dxgi.h>
+#include <dxgi1_4.h>
 #pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
 
 #endif //PCH_H
