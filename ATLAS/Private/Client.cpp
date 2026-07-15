@@ -4,6 +4,7 @@
 #include "../Public/FortPlayerControllerAthena.h"
 #include "../Public/Client.h"
 #include "../Public/Configuration.h"
+#include "../Public/Diagnostics.h"
 
 inline void* (*SelectResetOG)(void*) = nullptr;
 inline void* (*SelectEditOG)(void*) = nullptr;
@@ -21,6 +22,26 @@ static AFortPlayerControllerAthena* GetLocalFortPlayerController()
 		return nullptr;
 
 	return (AFortPlayerControllerAthena*)LocalPlayers[0]->PlayerController;
+}
+
+static bool IsLiveUObject(const UObject* object)
+{
+	if (!object)
+		return false;
+
+	__try
+	{
+		const int index = object->Index;
+		if (index < 0 || index >= TUObjectArray::Num())
+			return false;
+
+		const FUObjectItem* item = TUObjectArray::GetItemByIndex(index);
+		return item && item->Object == object && (item->Flags & 0x20) == 0;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		return false;
+	}
 }
 
 static void SafeCompleteBuildingEditInteraction()
@@ -125,58 +146,70 @@ void PerformBuildingEditInteraction(AFortPlayerControllerAthena* _this)
 
 void ClientThread()
 {
-	bool bPressed = false;
+	AFortPlayerControllerAthena* observedController = nullptr;
+	UFortCheatManager* observedManager = nullptr;
+
 	while (true)
 	{
-		if (UWorld::GetWorld() && UWorld::GetWorld()->OwningGameInstance)
+		auto playerController = GetLocalFortPlayerController();
+		if (playerController)
 		{
-			auto& LocalPlayers = UWorld::GetWorld()->OwningGameInstance->LocalPlayers;
-
-			if (LocalPlayers.Num() > 0)
+			auto cheatManager = playerController->CheatManager;
+			if (playerController != observedController || cheatManager != observedManager)
 			{
-				auto PlayerController = (AFortPlayerControllerAthena*)LocalPlayers[0]->PlayerController;
+				AtlasDiagnostics::WriteLine("manager-observed pc=%p manager=%p", playerController, cheatManager);
+				observedController = playerController;
+				observedManager = cheatManager;
+			}
 
-				if (PlayerController && !PlayerController->CheatManager)
+			if (cheatManager && !IsLiveUObject(cheatManager))
+			{
+				AtlasDiagnostics::WriteLine("manager-stale pc=%p manager=%p", playerController, cheatManager);
+				playerController->CheatManager = nullptr;
+				cheatManager = nullptr;
+				observedManager = nullptr;
+			}
+
+			if (!cheatManager)
+			{
+				auto cheatClass = playerController->CheatClass.Get();
+				if (cheatClass)
 				{
-					PlayerController->CheatManager = (UFortCheatManager*)UGameplayStatics::SpawnObject(PlayerController->CheatClass.Get(), PlayerController);
-					PlayerController->CheatManager->ObjectFlags &= ~0x1000000;
-					TUObjectArray::GetItemByIndex(PlayerController->CheatManager->Index)->Flags &= ~0x4000000;
+					cheatManager = (UFortCheatManager*)UGameplayStatics::SpawnObject(cheatClass, playerController);
+					if (cheatManager)
+					{
+						// Publish the reference while the async flags still protect the
+						// new object, then make it a normal GC-managed UObject.
+						playerController->CheatManager = cheatManager;
+						cheatManager->ObjectFlags &= ~0x1000000;
+						if (auto item = TUObjectArray::GetItemByIndex(cheatManager->Index))
+							item->Flags &= ~0x4000000;
+						observedManager = cheatManager;
+						AtlasDiagnostics::WriteLine("manager-created pc=%p manager=%p index=%d", playerController, cheatManager, cheatManager->Index);
+					}
+					else
+					{
+						AtlasDiagnostics::WriteLine("manager-create-failed pc=%p class=%p", playerController, cheatClass);
+					}
 				}
 			}
 		}
-
-		/*
-		if (!bPressed && GetAsyncKeyState(VK_F3))
+		else if (observedController)
 		{
-			bPressed = true;
-
-			FConfiguration::bEOREnabled ^= 1;
+			AtlasDiagnostics::WriteLine("controller-unavailable previous-pc=%p manager=%p", observedController, observedManager);
+			observedController = nullptr;
+			observedManager = nullptr;
 		}
-		else if (!bPressed && GetAsyncKeyState(VK_F4))
-		{
-			bPressed = true;
 
-			FConfiguration::bDisablePreEdits ^= 1;
-		}
-		else if (!bPressed && GetAsyncKeyState(VK_F2))
-		{
-			bPressed = true;
-			//bEnableResetOnRelease ^= 1;
-		}
-		else if (!GetAsyncKeyState(VK_F3) && !GetAsyncKeyState(VK_F4))
-			bPressed = false;
-		*/
-
-		// todo: add custom keybinds for stuff like tp to waypoint
-
-		Sleep(33); // thread runs at 30tps	
+		Sleep(33);
 	}
 }
 
 void Client::Init()
 {
-	if (FConfiguration::bConsoleEnabled)
-		UEngine::GetEngine()->GameViewport->ViewportConsole = UGameplayStatics::SpawnObject(UEngine::GetEngine()->ConsoleClass, UEngine::GetEngine()->GameViewport);
+	auto engine = UEngine::GetEngine();
+	if (FConfiguration::bConsoleEnabled && engine && engine->GameViewport && engine->ConsoleClass)
+		engine->GameViewport->ViewportConsole = UGameplayStatics::SpawnObject(engine->ConsoleClass, engine->GameViewport);
 
 	if (VersionInfo.EngineVersion < 4.24)
 		FConfiguration::bEOREnabled = true;
@@ -342,5 +375,5 @@ void Client::Init()
 		MH_EnableHook(MH_ALL_HOOKS);
 	}
 
-	CreateThread(0, 0, (LPTHREAD_START_ROUTINE)ClientThread, 0, 0, 0);
+	CreateThread(nullptr, 0, (LPTHREAD_START_ROUTINE)ClientThread, nullptr, 0, nullptr);
 }

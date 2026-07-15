@@ -161,7 +161,11 @@ static void InitImGuiBase(HWND hWnd)
 
 static void HandleOverlayInput()
 {
-    GUI_HandleInput();
+    // Each injected process owns a different game window. Gate actions at
+    // consumption time so a press queued just before an Alt+Tab cannot run in
+    // a background instance.
+    const bool windowActive = g_hWnd && GetForegroundWindow() == g_hWnd;
+    GUI_HandleInput(windowActive);
 
     if (FGUI::bVisible != g_WasVisible)
     {
@@ -475,29 +479,53 @@ static void RenderDX12(IDXGISwapChain* pSwapChain)
 
 static LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
+    const bool focusLifecycleMessage = msg == WM_KILLFOCUS || msg == WM_CANCELMODE ||
+        msg == WM_ACTIVATE || msg == WM_ACTIVATEAPP;
+    const bool foregroundGameWindow = hWnd == g_hWnd && GetForegroundWindow() == hWnd;
+    if (g_ImGuiReady && hWnd == g_hWnd && (foregroundGameWindow || focusLifecycleMessage))
+        GUI_QueueInputMessage(msg, wParam, lParam);
+
     if (g_ImGuiReady && FGUI::bVisible)
     {
         ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam);
 
         if (msg == WM_INPUT)
         {
-            BYTE rawBuffer[256];
-            UINT rawSize = sizeof(rawBuffer);
-            GetRawInputData((HRAWINPUT)lParam, RID_INPUT, rawBuffer, &rawSize, sizeof(RAWINPUTHEADER));
-            return 0;
+            // Foreground WM_INPUT requires DefWindowProc cleanup. Skipping it
+            // can eventually stall raw input for the process.
+            return DefWindowProcW(hWnd, msg, wParam, lParam);
         }
 
-        if (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP ||
-            msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP ||
-            msg == WM_MBUTTONDOWN || msg == WM_MBUTTONUP ||
-            msg == WM_MOUSEWHEEL || msg == WM_MOUSEMOVE ||
-            msg == WM_KEYDOWN || msg == WM_KEYUP ||
-            msg == WM_CHAR || msg == WM_SYSKEYDOWN ||
-            msg == WM_SYSKEYUP)
+        // Always let releases reach Unreal. A key/button may have gone down
+        // immediately before the overlay opened; swallowing its release leaves
+        // the game's input state stuck and can block inventory/actions.
+        if (msg == WM_LBUTTONUP || msg == WM_RBUTTONUP ||
+            msg == WM_MBUTTONUP || msg == WM_XBUTTONUP ||
+            msg == WM_KEYUP || msg == WM_SYSKEYUP)
+            return CallWindowProcW(OriginalWndProc, hWnd, msg, wParam, lParam);
+
+        if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN ||
+            msg == WM_MBUTTONDOWN || msg == WM_XBUTTONDOWN ||
+            msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL ||
+            msg == WM_MOUSEMOVE || msg == WM_KEYDOWN ||
+            msg == WM_CHAR || msg == WM_SYSKEYDOWN)
         {
             return 0;
         }
     }
+
+    if (g_ImGuiReady && !FGUI::bVisible && foregroundGameWindow)
+    {
+        // A saved command bind belongs exclusively to ATLAS. Forwarding the
+        // same MOUSE5/key press into Fortnite can activate a gameplay ability
+        // on every command and eventually saturate its uint8 ActiveCount.
+        if (msg == WM_INPUT && GUI_ShouldConsumeRawInput(lParam))
+            return DefWindowProcW(hWnd, msg, wParam, lParam);
+
+        if (GUI_ShouldConsumeInputMessage(msg, wParam))
+            return 0;
+    }
+
     return CallWindowProcW(OriginalWndProc, hWnd, msg, wParam, lParam);
 }
 

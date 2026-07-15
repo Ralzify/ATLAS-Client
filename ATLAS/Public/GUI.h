@@ -10,7 +10,10 @@
 
 void GUI_Init();
 void GUI_Render();
-void GUI_HandleInput();
+void GUI_HandleInput(bool windowActive);
+void GUI_QueueInputMessage(UINT message, WPARAM wParam, LPARAM lParam);
+bool GUI_ShouldConsumeInputMessage(UINT message, WPARAM wParam);
+bool GUI_ShouldConsumeRawInput(LPARAM lParam);
 void GUI_LoadTextures(ID3D11Device* device);
 void GUI_LoadTexturesDX12(ID3D12Device* device, ID3D12CommandQueue* commandQueue, D3D12_CPU_DESCRIPTOR_HANDLE srvCpu, D3D12_GPU_DESCRIPTOR_HANDLE srvGpu);
 

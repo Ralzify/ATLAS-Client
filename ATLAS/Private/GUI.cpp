@@ -3,11 +3,15 @@
 #include "../Public/Hotkey.h"
 #include "../Public/Configuration.h"
 #include "../Public/Client.h"
+#include "../Public/Diagnostics.h"
 #include "../Public/Icon.h"
 #include "../ImGui/imgui.h"
 
 #include <sstream>
 #include <iomanip>
+#include <array>
+#include <atomic>
+#include <deque>
 #include <vector>
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -77,14 +81,44 @@ static const char* BindName(int vk)
     return (vk > 0 && vk <= 254) ? VKName(vk) : "UNBOUND";
 }
 
+// Saved command hotkeys are actions owned by ATLAS. Keep an atomic lookup for
+// WndProc so those presses do not also activate the game's binding (MOUSE5 is
+// commonly bound to Jump, which can otherwise leave ability activations open).
+static std::array<std::atomic_bool, 0xFF> g_ExclusiveCommandHotkeys{};
+
+static void RefreshExclusiveCommandHotkeys()
+{
+    for (auto& exclusive : g_ExclusiveCommandHotkeys)
+        exclusive.store(false, std::memory_order_release);
+
+    for (const auto& command : FGUI::Commands)
+    {
+        if (command.VK > 0 && command.VK <= 0xFE)
+        {
+            g_ExclusiveCommandHotkeys[static_cast<size_t>(command.VK)].store(true, std::memory_order_release);
+            AtlasDiagnostics::WriteLine("command-hotkey-exclusive vk=%d command=%s", command.VK, command.Command.c_str());
+        }
+    }
+}
+
 void FGUI::SaveHotkey() { HotkeyPersist::Save(FGUI::HotkeyVK); }
 void FGUI::LoadHotkey() { FGUI::HotkeyVK = HotkeyPersist::Load(VK_F9); }
 
 void FGUI::SaveJoinHotkey() { HotkeyPersist::Save(FGUI::JoinHotkeyVK, "joinHotkey"); }
 void FGUI::LoadJoinHotkey() { FGUI::JoinHotkeyVK = HotkeyPersist::Load(VK_F5, "joinHotkey"); }
 
-void FGUI::SaveCommands() { HotkeyPersist::SaveCommands(FGUI::Commands); }
-void FGUI::LoadCommands() { FGUI::Commands = HotkeyPersist::LoadCommands(); }
+void FGUI::SaveCommands()
+{
+    HotkeyPersist::SaveCommands(FGUI::Commands);
+    RefreshExclusiveCommandHotkeys();
+}
+
+void FGUI::LoadCommands()
+{
+    FGUI::Commands = HotkeyPersist::LoadCommands();
+    RefreshExclusiveCommandHotkeys();
+}
+
 void FGUI::ResetAll()
 {
     FGUI::HotkeyVK = VK_F9;
@@ -95,6 +129,7 @@ void FGUI::ResetAll()
     FGUI::PendingCommandVK = 0;
     FGUI::CommandInput[0] = '\0';
     FGUI::Commands.clear();
+    RefreshExclusiveCommandHotkeys();
 
     HotkeyPersist::SaveAll(FGUI::HotkeyVK, FGUI::JoinHotkeyVK, {});
 }
@@ -524,48 +559,111 @@ static bool SidebarTab(const char* label, int index, float height)
     return pressed;
 }
 
-static void Exec(const char* cmd)
+static void ExecNow(const char* cmd)
 {
-    if (!UWorld::GetWorld() || !UWorld::GetWorld()->OwningGameInstance) return;
-    auto& lp = UWorld::GetWorld()->OwningGameInstance->LocalPlayers;
-    if (lp.Num() == 0) return;
-    auto pc = lp[0]->PlayerController;
-    if (!pc) return;
+    if (!cmd || !*cmd)
+        return;
 
-    int len = MultiByteToWideChar(CP_UTF8, 0, cmd, -1, nullptr, 0);
-    std::wstring ws(len - 1, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, cmd, -1, ws.data(), len);
-    UKismetSystemLibrary::ExecuteConsoleCommand(pc, FString(ws.c_str()));
+    auto world = UWorld::GetWorld();
+    if (!world || !world->OwningGameInstance)
+    {
+        AtlasDiagnostics::WriteLine("command-skip no-world command=%s", cmd);
+        return;
+    }
+
+    auto& localPlayers = world->OwningGameInstance->LocalPlayers;
+    if (localPlayers.Num() == 0 || !localPlayers[0] || !localPlayers[0]->PlayerController)
+    {
+        AtlasDiagnostics::WriteLine("command-skip no-player command=%s", cmd);
+        return;
+    }
+
+    const int len = MultiByteToWideChar(CP_UTF8, 0, cmd, -1, nullptr, 0);
+    if (len <= 1)
+        return;
+
+    std::wstring wide(static_cast<size_t>(len), L'\0');
+    if (MultiByteToWideChar(CP_UTF8, 0, cmd, -1, wide.data(), len) != len)
+        return;
+    wide.resize(static_cast<size_t>(len - 1));
+
+    FString command(wide.c_str());
+    AtlasDiagnostics::WriteLine("command-dispatch pc=%p command=%s", localPlayers[0]->PlayerController, cmd);
+    UKismetSystemLibrary::ExecuteConsoleCommand(localPlayers[0]->PlayerController, command);
+    AtlasDiagnostics::WriteLine("command-return command=%s", cmd);
+    command.Free();
 }
 
-static void ExecEngine(const char* cmd)
-{
-    auto World = UWorld::GetWorld();
-    if (!World) return;
+static std::deque<std::string> g_CommandQueue;
+static ULONGLONG g_LastCommandDispatch = 0;
 
-    int len = MultiByteToWideChar(CP_UTF8, 0, cmd, -1, nullptr, 0);
-    std::wstring ws(len - 1, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, cmd, -1, ws.data(), len);
-    UKismetSystemLibrary::ExecuteConsoleCommand(World, FString(ws.c_str()), nullptr);
+static void Exec(const char* cmd)
+{
+    if (!cmd || !*cmd)
+        return;
+
+    // Slider updates only need the newest FOV value; allowing old values to
+    // accumulate would delay later commands unnecessarily.
+    if (strncmp(cmd, "fov", 3) == 0 && (cmd[3] == '\0' || cmd[3] == ' '))
+    {
+        for (auto it = g_CommandQueue.begin(); it != g_CommandQueue.end();)
+        {
+            if (it->compare(0, 3, "fov") == 0 && (it->size() == 3 || (*it)[3] == ' '))
+                it = g_CommandQueue.erase(it);
+            else
+                ++it;
+        }
+    }
+
+    if (g_CommandQueue.size() < 32)
+    {
+        g_CommandQueue.emplace_back(cmd);
+        AtlasDiagnostics::WriteLine("command-enqueue depth=%zu command=%s", g_CommandQueue.size(), cmd);
+    }
+    else
+    {
+        AtlasDiagnostics::WriteLine("command-drop queue-full command=%s", cmd);
+    }
+}
+
+static void DispatchQueuedCommand()
+{
+    if (g_CommandQueue.empty())
+        return;
+
+    const ULONGLONG now = GetTickCount64();
+    if (g_LastCommandDispatch != 0 && now - g_LastCommandDispatch < 100)
+        return;
+
+    std::string command = std::move(g_CommandQueue.front());
+    g_CommandQueue.pop_front();
+    g_LastCommandDispatch = now;
+    ExecNow(command.c_str());
+}
+
+static void ClearQueuedCommands()
+{
+    if (!g_CommandQueue.empty())
+        AtlasDiagnostics::WriteLine("command-clear inactive depth=%zu", g_CommandQueue.size());
+    g_CommandQueue.clear();
+    g_LastCommandDispatch = 0;
 }
 
 static void SpawnConsole()
 {
-    auto Engine = UEngine::GetEngine();
-
-    if (Engine && Engine->GameViewport && Engine->ConsoleClass)
-        Engine->GameViewport->ViewportConsole = UGameplayStatics::SpawnObject(Engine->ConsoleClass, Engine->GameViewport);
+    auto engine = UEngine::GetEngine();
+    if (engine && engine->GameViewport && engine->ConsoleClass)
+        engine->GameViewport->ViewportConsole = UGameplayStatics::SpawnObject(engine->ConsoleClass, engine->GameViewport);
 }
 
 static void DestroyConsole()
 {
-    auto Engine = UEngine::GetEngine();
-
-    if (!Engine || !Engine->GameViewport || !Engine->GameViewport->ViewportConsole)
+    auto engine = UEngine::GetEngine();
+    if (!engine || !engine->GameViewport || !engine->GameViewport->ViewportConsole)
         return;
 
-    Engine->GameViewport->ViewportConsole->ObjectFlags |= 0x4;
-    Engine->GameViewport->ViewportConsole = nullptr;
+    engine->GameViewport->ViewportConsole->ObjectFlags |= 0x4;
+    engine->GameViewport->ViewportConsole = nullptr;
 }
 
 static void JoinSelectedHost()
@@ -587,6 +685,7 @@ static void JoinSelectedHost()
 
 void GUI_Init()
 {
+    AtlasDiagnostics::BeginSession(FConfiguration::ConsoleVersion);
     FGUI::LoadHotkey();
     FGUI::LoadJoinHotkey();
     FGUI::LoadCommands();
@@ -609,52 +708,190 @@ static bool IsBindableVK(int vk)
     return true;
 }
 
-static bool g_WaitingForBindRelease = false;
+using InputPressCounts = std::array<unsigned int, 0xFF>;
+static std::array<std::atomic_uint, 0xFF> g_InputPressCounts{};
+
+static void QueueKeyPress(int vk)
+{
+    if (vk <= 0 || vk > 0xFE)
+        return;
+
+    // A small cap prevents an unattended window from accumulating an
+    // unbounded number of actions while still preserving rapid key presses.
+    auto& count = g_InputPressCounts[static_cast<size_t>(vk)];
+    unsigned int current = count.load(std::memory_order_relaxed);
+    while (current < 8 &&
+        !count.compare_exchange_weak(current, current + 1,
+            std::memory_order_release, std::memory_order_relaxed))
+    {
+    }
+}
+
+static void ClearInputQueue()
+{
+    for (auto& count : g_InputPressCounts)
+        count.store(0, std::memory_order_release);
+}
+
+static int InputMessageVK(UINT message, WPARAM wParam)
+{
+    switch (message)
+    {
+    case WM_KEYDOWN:
+    case WM_KEYUP:
+    case WM_SYSKEYDOWN:
+    case WM_SYSKEYUP:
+        return static_cast<int>(wParam);
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONUP:
+    case WM_LBUTTONDBLCLK:
+        return VK_LBUTTON;
+    case WM_RBUTTONDOWN:
+    case WM_RBUTTONUP:
+    case WM_RBUTTONDBLCLK:
+        return VK_RBUTTON;
+    case WM_MBUTTONDOWN:
+    case WM_MBUTTONUP:
+    case WM_MBUTTONDBLCLK:
+        return VK_MBUTTON;
+    case WM_XBUTTONDOWN:
+    case WM_XBUTTONUP:
+    case WM_XBUTTONDBLCLK:
+        return GET_XBUTTON_WPARAM(wParam) == XBUTTON1 ? VK_XBUTTON1 : VK_XBUTTON2;
+    default:
+        return 0;
+    }
+}
+
+static bool IsExclusiveCommandHotkey(int vk)
+{
+    return vk > 0 && vk <= 0xFE &&
+        g_ExclusiveCommandHotkeys[static_cast<size_t>(vk)].load(std::memory_order_acquire);
+}
+
+bool GUI_ShouldConsumeInputMessage(UINT message, WPARAM wParam)
+{
+    return IsExclusiveCommandHotkey(InputMessageVK(message, wParam));
+}
+
+bool GUI_ShouldConsumeRawInput(LPARAM lParam)
+{
+    RAWINPUT raw{};
+    UINT rawSize = sizeof(raw);
+    if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT, &raw,
+        &rawSize, sizeof(RAWINPUTHEADER)) == static_cast<UINT>(-1))
+        return false;
+
+    if (raw.header.dwType == RIM_TYPEKEYBOARD)
+        return IsExclusiveCommandHotkey(static_cast<int>(raw.data.keyboard.VKey));
+
+    if (raw.header.dwType != RIM_TYPEMOUSE)
+        return false;
+
+    const USHORT flags = raw.data.mouse.usButtonFlags;
+    return ((flags & (RI_MOUSE_BUTTON_1_DOWN | RI_MOUSE_BUTTON_1_UP)) && IsExclusiveCommandHotkey(VK_LBUTTON)) ||
+        ((flags & (RI_MOUSE_BUTTON_2_DOWN | RI_MOUSE_BUTTON_2_UP)) && IsExclusiveCommandHotkey(VK_RBUTTON)) ||
+        ((flags & (RI_MOUSE_BUTTON_3_DOWN | RI_MOUSE_BUTTON_3_UP)) && IsExclusiveCommandHotkey(VK_MBUTTON)) ||
+        ((flags & (RI_MOUSE_BUTTON_4_DOWN | RI_MOUSE_BUTTON_4_UP)) && IsExclusiveCommandHotkey(VK_XBUTTON1)) ||
+        ((flags & (RI_MOUSE_BUTTON_5_DOWN | RI_MOUSE_BUTTON_5_UP)) && IsExclusiveCommandHotkey(VK_XBUTTON2));
+}
+
+void GUI_QueueInputMessage(UINT message, WPARAM wParam, LPARAM lParam)
+{
+    int vk = InputMessageVK(message, wParam);
+
+    switch (message)
+    {
+    case WM_KEYDOWN:
+    case WM_SYSKEYDOWN:
+        // Ignore keyboard auto-repeat. Each physical down transition should
+        // run a bind once.
+        if ((static_cast<ULONG_PTR>(lParam) & (1ull << 30)) == 0)
+            vk = static_cast<int>(wParam);
+        else
+            vk = 0;
+        break;
+    case WM_LBUTTONDOWN:
+    case WM_RBUTTONDOWN:
+    case WM_MBUTTONDOWN:
+    case WM_XBUTTONDOWN:
+        break;
+    case WM_KILLFOCUS:
+    case WM_CANCELMODE:
+        ClearInputQueue();
+        return;
+    case WM_ACTIVATE:
+        if (LOWORD(wParam) == WA_INACTIVE)
+            ClearInputQueue();
+        return;
+    case WM_ACTIVATEAPP:
+        if (!wParam)
+            ClearInputQueue();
+        return;
+    default:
+        return;
+    }
+
+    QueueKeyPress(vk);
+}
+
+static InputPressCounts TakeInputPresses()
+{
+    InputPressCounts presses{};
+    for (size_t i = 0; i < presses.size(); i++)
+        presses[i] = g_InputPressCounts[i].exchange(0, std::memory_order_acq_rel);
+    return presses;
+}
+
+static unsigned int TakePressCount(InputPressCounts& presses, int vk)
+{
+    if (vk <= 0 || vk > 0xFE)
+        return 0;
+
+    unsigned int count = presses[static_cast<size_t>(vk)];
+    presses[static_cast<size_t>(vk)] = 0;
+    return count;
+}
 
 static void BeginBindCapture()
 {
-    g_WaitingForBindRelease = true;
-
-    for (int vk = 0x01; vk <= 0xFE; vk++)
-        if (IsBindableVK(vk))
-            GetAsyncKeyState(vk);
+    // Discard the click/key that activated the bind button. A subsequent
+    // window-message transition will be the key the user intended to bind.
+    ClearInputQueue();
 }
 
 static void EndBindCapture()
 {
-    g_WaitingForBindRelease = false;
+    ClearInputQueue();
 }
 
-static bool AnyBindableInputDown()
+static int PollBindKey(const InputPressCounts& presses)
 {
     for (int vk = 0x01; vk <= 0xFE; vk++)
-        if (IsBindableVK(vk) && (GetAsyncKeyState(vk) & 0x8000))
-            return true;
-
-    return false;
-}
-
-static int PollBindKey()
-{
-    if (g_WaitingForBindRelease)
-    {
-        if (AnyBindableInputDown())
-            return 0;
-
-        g_WaitingForBindRelease = false;
-        return 0;
-    }
-
-    for (int vk = 0x01; vk <= 0xFE; vk++)
-        if (IsBindableVK(vk) && (GetAsyncKeyState(vk) & 0x8000))
+        if (IsBindableVK(vk) && presses[static_cast<size_t>(vk)] > 0)
             return vk;
 
     return 0;
 }
 
-void GUI_HandleInput()
+void GUI_HandleInput(bool windowActive)
 {
-    if ((FGUI::bRebinding || FGUI::bRebindingJoin || FGUI::RebindingCommandIndex != -2) && (GetAsyncKeyState(VK_ESCAPE) & 1))
+    InputPressCounts presses = TakeInputPresses();
+    if (!windowActive)
+    {
+        ClearQueuedCommands();
+        return;
+    }
+
+    // Never execute a burst of accumulated ProcessEvent calls in one Present.
+    // One command per 100 ms keeps rapid binds responsive without re-entering
+    // cheat/inventory state changes before the previous command has settled.
+    DispatchQueuedCommand();
+
+    const bool wasVisible = FGUI::bVisible;
+
+    if ((FGUI::bRebinding || FGUI::bRebindingJoin || FGUI::RebindingCommandIndex != -2) &&
+        TakePressCount(presses, VK_ESCAPE) > 0)
     {
         FGUI::bRebinding = false;
         FGUI::bRebindingJoin = false;
@@ -665,7 +902,7 @@ void GUI_HandleInput()
 
     if (FGUI::bRebinding)
     {
-        if (int vk = PollBindKey())
+        if (int vk = PollBindKey(presses))
         {
             FGUI::HotkeyVK = vk;
             FGUI::bRebinding = false;
@@ -677,7 +914,7 @@ void GUI_HandleInput()
 
     if (FGUI::bRebindingJoin)
     {
-        if (int vk = PollBindKey())
+        if (int vk = PollBindKey(presses))
         {
             FGUI::JoinHotkeyVK = vk;
             FGUI::bRebindingJoin = false;
@@ -689,7 +926,7 @@ void GUI_HandleInput()
 
     if (FGUI::RebindingCommandIndex != -2)
     {
-        if (int vk = PollBindKey())
+        if (int vk = PollBindKey(presses))
         {
             if (FGUI::RebindingCommandIndex == -1)
             {
@@ -707,17 +944,21 @@ void GUI_HandleInput()
         return;
     }
 
-    if (GetAsyncKeyState(FGUI::HotkeyVK) & 1)
+    const unsigned int hotkeyPresses = TakePressCount(presses, FGUI::HotkeyVK);
+    if ((hotkeyPresses & 1u) != 0)
         FGUI::bVisible = !FGUI::bVisible;
 
-    if (GetAsyncKeyState(FGUI::JoinHotkeyVK) & 1)
+    if (TakePressCount(presses, FGUI::JoinHotkeyVK) > 0)
         JoinSelectedHost();
 
-    if (!FGUI::bVisible)
+    // Do not execute presses made while the overlay was visible, including
+    // other keys received in the same batch as the close hotkey.
+    if (!wasVisible && !FGUI::bVisible)
     {
         for (const auto& command : FGUI::Commands)
         {
-            if (command.VK > 0 && command.VK <= 254 && (GetAsyncKeyState(command.VK) & 1))
+            const unsigned int pressCount = TakePressCount(presses, command.VK);
+            for (unsigned int i = 0; i < pressCount; i++)
                 Exec(command.Command.c_str());
         }
     }
