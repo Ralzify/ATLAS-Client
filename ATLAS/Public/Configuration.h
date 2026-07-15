@@ -4,7 +4,7 @@
 
 struct FConfiguration
 {
-	static inline const char* ConsoleVersion = "v1.0.2-hotkey-isolation";
+	static inline const char* ConsoleVersion = "v1.0.1";
 
 	static inline bool bConsoleEnabled = true;
 	static inline bool bForceRespawns = true;

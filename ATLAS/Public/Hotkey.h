@@ -17,6 +17,34 @@ namespace HotkeyPersist
         int DefaultVK = 0;
     };
 
+    // A macro is intentionally command-only: no synthetic keyboard or mouse
+    // input is sent to the game. Each delay is the wait after that step.
+    struct MacroStep
+    {
+        std::string Command;
+        int DelayMs = 250;
+    };
+
+    struct CommandMacro
+    {
+        std::string Name;
+        int VK = 0;
+        int DefaultVK = 0;
+        std::vector<MacroStep> Steps;
+    };
+
+    static constexpr int MinMacroDelayMs = 100;
+    static constexpr int MaxMacroDelayMs = 60000;
+
+    inline int SanitizeMacroDelayMs(int value)
+    {
+        if (value < MinMacroDelayMs)
+            return MinMacroDelayMs;
+        if (value > MaxMacroDelayMs)
+            return MaxMacroDelayMs;
+        return value;
+    }
+
     inline std::wstring GetSettingsPath()
     {
         wchar_t path[MAX_PATH]{};
@@ -322,7 +350,97 @@ namespace HotkeyPersist
         return commands;
     }
 
-    inline void SaveAll(int hotkey, int joinHotkey, const std::vector<CommandBind>& commands)
+    inline std::vector<MacroStep> ParseMacroSteps(const std::string& macroObject)
+    {
+        std::vector<MacroStep> steps;
+
+        auto pos = macroObject.find("\"steps\"");
+        if (pos == std::string::npos)
+            return steps;
+
+        const auto arrayStart = macroObject.find('[', pos);
+        if (arrayStart == std::string::npos)
+            return steps;
+
+        const auto arrayEnd = FindArrayEnd(macroObject, arrayStart);
+        if (arrayEnd == std::string::npos)
+            return steps;
+
+        pos = arrayStart + 1;
+        while (pos < arrayEnd)
+        {
+            const auto objStart = macroObject.find('{', pos);
+            if (objStart == std::string::npos || objStart >= arrayEnd)
+                break;
+
+            const auto objEnd = FindObjectEnd(macroObject, objStart);
+            if (objEnd == std::string::npos || objEnd > arrayEnd)
+                break;
+
+            const std::string obj = macroObject.substr(objStart, objEnd - objStart + 1);
+            MacroStep step{};
+            step.Command = ParseStringField(obj, "command");
+            step.DelayMs = SanitizeMacroDelayMs(ParseIntField(obj, "delayMs", step.DelayMs));
+            if (!step.Command.empty())
+                steps.push_back(std::move(step));
+
+            pos = objEnd + 1;
+        }
+
+        return steps;
+    }
+
+    inline std::vector<CommandMacro> ParseMacros(const std::string& content)
+    {
+        std::vector<CommandMacro> macros;
+
+        auto pos = content.find("\"macros\"");
+        if (pos == std::string::npos)
+            return macros;
+
+        const auto arrayStart = content.find('[', pos);
+        if (arrayStart == std::string::npos)
+            return macros;
+
+        const auto arrayEnd = FindArrayEnd(content, arrayStart);
+        if (arrayEnd == std::string::npos)
+            return macros;
+
+        pos = arrayStart + 1;
+        while (pos < arrayEnd)
+        {
+            const auto objStart = content.find('{', pos);
+            if (objStart == std::string::npos || objStart >= arrayEnd)
+                break;
+
+            const auto objEnd = FindObjectEnd(content, objStart);
+            if (objEnd == std::string::npos || objEnd > arrayEnd)
+                break;
+
+            const std::string obj = content.substr(objStart, objEnd - objStart + 1);
+            CommandMacro macro{};
+            macro.Name = ParseStringField(obj, "name");
+            macro.VK = ParseIntField(obj, "vk", 0);
+            macro.DefaultVK = ParseIntField(obj, "defaultVK", macro.VK);
+            macro.Steps = ParseMacroSteps(obj);
+
+            if (!macro.Steps.empty())
+            {
+                if (macro.VK < 0 || macro.VK > 254)
+                    macro.VK = 0;
+                if (macro.DefaultVK < 0 || macro.DefaultVK > 254)
+                    macro.DefaultVK = 0;
+                macros.push_back(std::move(macro));
+            }
+
+            pos = objEnd + 1;
+        }
+
+        return macros;
+    }
+
+    inline void SaveAll(int hotkey, int joinHotkey, const std::vector<CommandBind>& commands,
+        const std::vector<CommandMacro>& macros = {})
     {
         auto path = GetSettingsPath();
         std::ofstream f(path, std::ios::trunc);
@@ -341,6 +459,30 @@ namespace HotkeyPersist
             f << "    { \"command\": \"" << EscapeJson(command.Command) << "\", \"vk\": " << command.VK
                 << ", \"defaultVK\": " << command.DefaultVK << " }";
             if (i + 1 < commands.size())
+                f << ",";
+            f << "\n";
+        }
+
+        f << "  ],\n";
+        f << "  \"macros\": [\n";
+
+        for (size_t i = 0; i < macros.size(); i++)
+        {
+            const auto& macro = macros[i];
+            f << "    { \"name\": \"" << EscapeJson(macro.Name) << "\", \"vk\": " << macro.VK
+                << ", \"defaultVK\": " << macro.DefaultVK << ", \"steps\": [";
+
+            for (size_t stepIndex = 0; stepIndex < macro.Steps.size(); stepIndex++)
+            {
+                const auto& step = macro.Steps[stepIndex];
+                f << "{ \"command\": \"" << EscapeJson(step.Command) << "\", \"delayMs\": "
+                    << SanitizeMacroDelayMs(step.DelayMs) << " }";
+                if (stepIndex + 1 < macro.Steps.size())
+                    f << ", ";
+            }
+
+            f << "] }";
+            if (i + 1 < macros.size())
                 f << ",";
             f << "\n";
         }
@@ -364,6 +506,11 @@ namespace HotkeyPersist
         return ParseCommands(ReadFileContents());
     }
 
+    inline std::vector<CommandMacro> LoadMacros()
+    {
+        return ParseMacros(ReadFileContents());
+    }
+
     inline void Save(int vk, const char* key = "hotkey")
     {
         std::string content = ReadFileContents();
@@ -371,18 +518,20 @@ namespace HotkeyPersist
         int hotkey = ParseKey(content, "hotkey", VK_F9);
         int joinHotkey = ParseKey(content, "joinHotkey", VK_F5);
         std::vector<CommandBind> commands = ParseCommands(content);
+        std::vector<CommandMacro> macros = ParseMacros(content);
 
         if (strcmp(key, "hotkey") == 0)
             hotkey = vk;
         else if (strcmp(key, "joinHotkey") == 0)
             joinHotkey = vk;
 
-        SaveAll(hotkey, joinHotkey, commands);
+        SaveAll(hotkey, joinHotkey, commands, macros);
     }
 
-    inline void SaveCommands(const std::vector<CommandBind>& commands)
+    inline void SaveCommands(const std::vector<CommandBind>& commands,
+        const std::vector<CommandMacro>& macros = ParseMacros(ReadFileContents()))
     {
         std::string content = ReadFileContents();
-        SaveAll(ParseKey(content, "hotkey", VK_F9), ParseKey(content, "joinHotkey", VK_F5), commands);
+        SaveAll(ParseKey(content, "hotkey", VK_F9), ParseKey(content, "joinHotkey", VK_F5), commands, macros);
     }
 }

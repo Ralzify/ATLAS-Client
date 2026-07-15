@@ -1,6 +1,7 @@
 ﻿#include "pch.h"
 #include "../Public/Client.h"
 #include "../Public/Configuration.h"
+#include "../Public/Diagnostics.h"
 #include "../Public/Finders.h"
 #include "../Public/GUI.h"
 #include <atomic>
@@ -41,6 +42,10 @@ static std::atomic_bool g_DX12QueueHookInstalled = false;
 static bool g_LoggedUnsupportedRenderer = false;
 static bool g_LoggedDX12QueueWait = false;
 static bool g_WasVisible = false;
+// Defaults to false so a process cannot accept hotkeys before Main has
+// classified it. The -nullrhi host keeps its server-side CheatManager setup,
+// but it must never consume or dispatch GUI input.
+static std::atomic_bool g_InteractiveInputEnabled = false;
 
 enum class ERenderBackend
 {
@@ -161,6 +166,12 @@ static void InitImGuiBase(HWND hWnd)
 
 static void HandleOverlayInput()
 {
+    if (!g_InteractiveInputEnabled.load(std::memory_order_acquire))
+    {
+        GUI_HandleInput(false);
+        return;
+    }
+
     // Each injected process owns a different game window. Gate actions at
     // consumption time so a press queued just before an Alt+Tab cannot run in
     // a background instance.
@@ -479,13 +490,14 @@ static void RenderDX12(IDXGISwapChain* pSwapChain)
 
 static LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
+    const bool interactiveInput = g_InteractiveInputEnabled.load(std::memory_order_acquire);
     const bool focusLifecycleMessage = msg == WM_KILLFOCUS || msg == WM_CANCELMODE ||
         msg == WM_ACTIVATE || msg == WM_ACTIVATEAPP;
     const bool foregroundGameWindow = hWnd == g_hWnd && GetForegroundWindow() == hWnd;
-    if (g_ImGuiReady && hWnd == g_hWnd && (foregroundGameWindow || focusLifecycleMessage))
+    if (g_ImGuiReady && interactiveInput && hWnd == g_hWnd && (foregroundGameWindow || focusLifecycleMessage))
         GUI_QueueInputMessage(msg, wParam, lParam);
 
-    if (g_ImGuiReady && FGUI::bVisible)
+    if (g_ImGuiReady && interactiveInput && FGUI::bVisible)
     {
         ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam);
 
@@ -514,7 +526,7 @@ static LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
         }
     }
 
-    if (g_ImGuiReady && !FGUI::bVisible && foregroundGameWindow)
+    if (g_ImGuiReady && interactiveInput && !FGUI::bVisible && foregroundGameWindow)
     {
         // A saved command bind belongs exclusively to ATLAS. Forwarding the
         // same MOUSE5/key press into Fortnite can activate a gameplay ability
@@ -740,6 +752,11 @@ void ForceIris(uintptr_t IrisBool)
 
 void Main()
 {
+    const wchar_t* commandLine = GetCommandLineW();
+    const bool headlessHost = commandLine && wcsstr(commandLine, L"-nullrhi") != nullptr;
+    g_InteractiveInputEnabled.store(!headlessHost, std::memory_order_release);
+    AtlasDiagnostics::WriteLine("process-role interactive-input=%s", headlessHost ? "disabled-headless-host" : "enabled-client");
+
     std::thread(InstallDXHookThread).detach();
 
     SDK::Init();

@@ -99,6 +99,15 @@ static void RefreshExclusiveCommandHotkeys()
             AtlasDiagnostics::WriteLine("command-hotkey-exclusive vk=%d command=%s", command.VK, command.Command.c_str());
         }
     }
+
+    for (const auto& macro : FGUI::Macros)
+    {
+        if (macro.VK > 0 && macro.VK <= 0xFE)
+        {
+            g_ExclusiveCommandHotkeys[static_cast<size_t>(macro.VK)].store(true, std::memory_order_release);
+            AtlasDiagnostics::WriteLine("macro-hotkey-exclusive vk=%d macro=%s", macro.VK, macro.Name.c_str());
+        }
+    }
 }
 
 void FGUI::SaveHotkey() { HotkeyPersist::Save(FGUI::HotkeyVK); }
@@ -109,13 +118,25 @@ void FGUI::LoadJoinHotkey() { FGUI::JoinHotkeyVK = HotkeyPersist::Load(VK_F5, "j
 
 void FGUI::SaveCommands()
 {
-    HotkeyPersist::SaveCommands(FGUI::Commands);
+    HotkeyPersist::SaveCommands(FGUI::Commands, FGUI::Macros);
     RefreshExclusiveCommandHotkeys();
 }
 
 void FGUI::LoadCommands()
 {
     FGUI::Commands = HotkeyPersist::LoadCommands();
+    RefreshExclusiveCommandHotkeys();
+}
+
+void FGUI::SaveMacros()
+{
+    HotkeyPersist::SaveCommands(FGUI::Commands, FGUI::Macros);
+    RefreshExclusiveCommandHotkeys();
+}
+
+void FGUI::LoadMacros()
+{
+    FGUI::Macros = HotkeyPersist::LoadMacros();
     RefreshExclusiveCommandHotkeys();
 }
 
@@ -126,12 +147,16 @@ void FGUI::ResetAll()
     FGUI::bRebinding = false;
     FGUI::bRebindingJoin = false;
     FGUI::RebindingCommandIndex = -2;
+    FGUI::RebindingMacroIndex = -2;
     FGUI::PendingCommandVK = 0;
     FGUI::CommandInput[0] = '\0';
+    FGUI::MacroDelayInput[0] = '\0';
     FGUI::Commands.clear();
+    FGUI::Macros.clear();
+    FGUI::MacroDraftSteps.clear();
     RefreshExclusiveCommandHotkeys();
 
-    HotkeyPersist::SaveAll(FGUI::HotkeyVK, FGUI::JoinHotkeyVK, {});
+    HotkeyPersist::SaveAll(FGUI::HotkeyVK, FGUI::JoinHotkeyVK, {}, {});
 }
 
 void GUI_LoadTextures(ID3D11Device* device)
@@ -596,6 +621,18 @@ static void ExecNow(const char* cmd)
 
 static std::deque<std::string> g_CommandQueue;
 static ULONGLONG g_LastCommandDispatch = 0;
+static constexpr ULONGLONG kMinimumCommandIntervalMs = 100;
+static constexpr size_t kMaximumQueuedMacroRuns = 8;
+
+struct QueuedMacroRun
+{
+    std::string Name;
+    std::vector<HotkeyPersist::MacroStep> Steps;
+    size_t NextStep = 0;
+    ULONGLONG NextDispatchAt = 0;
+};
+
+static std::deque<QueuedMacroRun> g_MacroRunQueue;
 
 static void Exec(const char* cmd)
 {
@@ -626,13 +663,76 @@ static void Exec(const char* cmd)
     }
 }
 
-static void DispatchQueuedCommand()
+static void QueueMacro(const HotkeyPersist::CommandMacro& macro)
 {
-    if (g_CommandQueue.empty())
+    if (macro.Steps.empty())
         return;
 
+    if (g_MacroRunQueue.size() >= kMaximumQueuedMacroRuns)
+    {
+        AtlasDiagnostics::WriteLine("macro-drop queue-full macro=%s", macro.Name.c_str());
+        return;
+    }
+
+    QueuedMacroRun run{};
+    run.Name = macro.Name;
+    run.Steps.reserve(macro.Steps.size());
+
+    for (const auto& step : macro.Steps)
+    {
+        if (step.Command.empty())
+            continue;
+
+        HotkeyPersist::MacroStep copy = step;
+        copy.DelayMs = HotkeyPersist::SanitizeMacroDelayMs(copy.DelayMs);
+        run.Steps.push_back(std::move(copy));
+    }
+
+    if (run.Steps.empty())
+        return;
+
+    g_MacroRunQueue.push_back(std::move(run));
+    AtlasDiagnostics::WriteLine("macro-enqueue depth=%zu macro=%s steps=%zu", g_MacroRunQueue.size(),
+        macro.Name.c_str(), macro.Steps.size());
+}
+
+static void DispatchQueuedCommand()
+{
     const ULONGLONG now = GetTickCount64();
-    if (g_LastCommandDispatch != 0 && now - g_LastCommandDispatch < 100)
+    if (g_LastCommandDispatch != 0 && now - g_LastCommandDispatch < kMinimumCommandIntervalMs)
+        return;
+
+    // Run each macro in sequence. The next delay is measured from the actual
+    // dispatch time, so frame hitches cannot collapse multiple commands into
+    // one unsafe burst.
+    if (!g_MacroRunQueue.empty())
+    {
+        auto& run = g_MacroRunQueue.front();
+        if (run.NextDispatchAt != 0 && now < run.NextDispatchAt)
+            return;
+
+        if (run.NextStep >= run.Steps.size())
+        {
+            g_MacroRunQueue.pop_front();
+            return;
+        }
+
+        HotkeyPersist::MacroStep step = run.Steps[run.NextStep++];
+        const bool completed = run.NextStep >= run.Steps.size();
+        const std::string macroName = run.Name;
+        const size_t stepNumber = run.NextStep;
+        if (completed)
+            g_MacroRunQueue.pop_front();
+        else
+            run.NextDispatchAt = now + static_cast<ULONGLONG>(HotkeyPersist::SanitizeMacroDelayMs(step.DelayMs));
+
+        g_LastCommandDispatch = now;
+        AtlasDiagnostics::WriteLine("macro-dispatch macro=%s step=%zu command=%s", macroName.c_str(), stepNumber, step.Command.c_str());
+        ExecNow(step.Command.c_str());
+        return;
+    }
+
+    if (g_CommandQueue.empty())
         return;
 
     std::string command = std::move(g_CommandQueue.front());
@@ -645,7 +745,10 @@ static void ClearQueuedCommands()
 {
     if (!g_CommandQueue.empty())
         AtlasDiagnostics::WriteLine("command-clear inactive depth=%zu", g_CommandQueue.size());
+    if (!g_MacroRunQueue.empty())
+        AtlasDiagnostics::WriteLine("macro-clear inactive depth=%zu", g_MacroRunQueue.size());
     g_CommandQueue.clear();
+    g_MacroRunQueue.clear();
     g_LastCommandDispatch = 0;
 }
 
@@ -689,6 +792,7 @@ void GUI_Init()
     FGUI::LoadHotkey();
     FGUI::LoadJoinHotkey();
     FGUI::LoadCommands();
+    FGUI::LoadMacros();
     PushStyle();
 }
 
@@ -890,12 +994,13 @@ void GUI_HandleInput(bool windowActive)
 
     const bool wasVisible = FGUI::bVisible;
 
-    if ((FGUI::bRebinding || FGUI::bRebindingJoin || FGUI::RebindingCommandIndex != -2) &&
+    if ((FGUI::bRebinding || FGUI::bRebindingJoin || FGUI::RebindingCommandIndex != -2 || FGUI::RebindingMacroIndex != -2) &&
         TakePressCount(presses, VK_ESCAPE) > 0)
     {
         FGUI::bRebinding = false;
         FGUI::bRebindingJoin = false;
         FGUI::RebindingCommandIndex = -2;
+        FGUI::RebindingMacroIndex = -2;
         EndBindCapture();
         return;
     }
@@ -906,6 +1011,7 @@ void GUI_HandleInput(bool windowActive)
         {
             FGUI::HotkeyVK = vk;
             FGUI::bRebinding = false;
+            FGUI::RebindingMacroIndex = -2;
             FGUI::SaveHotkey();
             EndBindCapture();
         }
@@ -918,6 +1024,7 @@ void GUI_HandleInput(bool windowActive)
         {
             FGUI::JoinHotkeyVK = vk;
             FGUI::bRebindingJoin = false;
+            FGUI::RebindingMacroIndex = -2;
             FGUI::SaveJoinHotkey();
             EndBindCapture();
         }
@@ -944,6 +1051,22 @@ void GUI_HandleInput(bool windowActive)
         return;
     }
 
+    if (FGUI::RebindingMacroIndex != -2)
+    {
+        if (int vk = PollBindKey(presses))
+        {
+            if (FGUI::RebindingMacroIndex >= 0 && FGUI::RebindingMacroIndex < (int)FGUI::Macros.size())
+            {
+                FGUI::Macros[FGUI::RebindingMacroIndex].VK = vk;
+                FGUI::SaveMacros();
+            }
+
+            FGUI::RebindingMacroIndex = -2;
+            EndBindCapture();
+        }
+        return;
+    }
+
     const unsigned int hotkeyPresses = TakePressCount(presses, FGUI::HotkeyVK);
     if ((hotkeyPresses & 1u) != 0)
         FGUI::bVisible = !FGUI::bVisible;
@@ -960,6 +1083,13 @@ void GUI_HandleInput(bool windowActive)
             const unsigned int pressCount = TakePressCount(presses, command.VK);
             for (unsigned int i = 0; i < pressCount; i++)
                 Exec(command.Command.c_str());
+        }
+
+        for (const auto& macro : FGUI::Macros)
+        {
+            const unsigned int pressCount = TakePressCount(presses, macro.VK);
+            for (unsigned int i = 0; i < pressCount; i++)
+                QueueMacro(macro);
         }
     }
 }
@@ -1236,25 +1366,14 @@ void GUI_Render()
 
         ImGui::Spacing();
 
-        char pendingBindLabel[64];
-        if (FGUI::RebindingCommandIndex == -1)
-            snprintf(pendingBindLabel, sizeof(pendingBindLabel), "Press any key...  (Esc to cancel)");
-        else
-            snprintf(pendingBindLabel, sizeof(pendingBindLabel), "Bind Key    [%s]", BindName(FGUI::PendingCommandVK));
-
         const float AddButtonW = 110.f;
-        const float BindButtonW = CW - AddButtonW - ImGui::GetStyle().ItemSpacing.x;
-        if (ImGui::Button(pendingBindLabel, ImVec2(BindButtonW > 140.f ? BindButtonW : 140.f, 0.f)))
-        {
-            FGUI::RebindingCommandIndex = -1;
-            FGUI::bRebinding = false;
-            FGUI::bRebindingJoin = false;
-            BeginBindCapture();
-        }
-
+        const float DelayInputW = CW - AddButtonW - ImGui::GetStyle().ItemSpacing.x;
+        ImGui::PushItemWidth(DelayInputW > 140.f ? DelayInputW : 140.f);
+        ImGui::InputTextWithHint("##stepdelay", "Wait before next step (ms)", FGUI::MacroDelayInput, sizeof(FGUI::MacroDelayInput), ImGuiInputTextFlags_CharsDecimal);
+        ImGui::PopItemWidth();
         ImGui::SameLine();
 
-        if (ImGui::Button("Save Command", ImVec2(AddButtonW, 0.f)))
+        if (ImGui::Button("Add Step", ImVec2(AddButtonW, 0.f)))
         {
             const char* start = FGUI::CommandInput;
             while (*start == ' ' || *start == '\t')
@@ -1262,12 +1381,108 @@ void GUI_Render()
 
             if (*start)
             {
-                HotkeyPersist::CommandBind command{};
-                command.Command = start;
-                command.VK = (FGUI::PendingCommandVK > 0 && FGUI::PendingCommandVK <= 254) ? FGUI::PendingCommandVK : 0;
-                command.DefaultVK = command.VK;
-                FGUI::Commands.push_back(command);
+                HotkeyPersist::MacroStep step{};
+                step.Command = start;
+                step.DelayMs = HotkeyPersist::SanitizeMacroDelayMs(atoi(FGUI::MacroDelayInput));
+                FGUI::MacroDraftSteps.push_back(std::move(step));
                 FGUI::CommandInput[0] = '\0';
+            }
+        }
+
+        if (!FGUI::MacroDraftSteps.empty())
+        {
+            ImGui::Spacing();
+            ImGui::PushID("draftsteps");
+            for (int i = 0; i < (int)FGUI::MacroDraftSteps.size(); i++)
+            {
+                auto& step = FGUI::MacroDraftSteps[i];
+                ImGui::PushID(i);
+
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.847f, 0.878f, 0.941f, 1.f));
+                ImGui::TextWrapped("%s", step.Command.c_str());
+                ImGui::PopStyleColor();
+                ImGui::SameLine();
+
+                if (ImGui::SmallButton("Remove"))
+                {
+                    FGUI::MacroDraftSteps.erase(FGUI::MacroDraftSteps.begin() + i);
+                    ImGui::PopID();
+                    break;
+                }
+
+                if (i + 1 < (int)FGUI::MacroDraftSteps.size())
+                {
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.353f, 0.388f, 0.478f, 1.f));
+                    ImGui::Text("Wait: %d ms", step.DelayMs);
+                    ImGui::PopStyleColor();
+                }
+
+                ImGui::PopID();
+            }
+            ImGui::PopID();
+        }
+
+        ImGui::Spacing();
+
+        char pendingBindLabel[64];
+        if (FGUI::RebindingCommandIndex == -1)
+            snprintf(pendingBindLabel, sizeof(pendingBindLabel), "Press any key...  (Esc to cancel)");
+        else
+            snprintf(pendingBindLabel, sizeof(pendingBindLabel), "Bind Key    [%s]", BindName(FGUI::PendingCommandVK));
+
+        const float BindButtonW = CW - AddButtonW - ImGui::GetStyle().ItemSpacing.x;
+        if (ImGui::Button(pendingBindLabel, ImVec2(BindButtonW > 140.f ? BindButtonW : 140.f, 0.f)))
+        {
+            FGUI::RebindingCommandIndex = -1;
+            FGUI::RebindingMacroIndex = -2;
+            FGUI::bRebinding = false;
+            FGUI::bRebindingJoin = false;
+            BeginBindCapture();
+        }
+
+        ImGui::SameLine();
+
+        if (ImGui::Button("Save", ImVec2(AddButtonW, 0.f)))
+        {
+            std::vector<HotkeyPersist::MacroStep> steps = FGUI::MacroDraftSteps;
+
+            const char* start = FGUI::CommandInput;
+            while (*start == ' ' || *start == '\t')
+                start++;
+
+            if (*start)
+            {
+                HotkeyPersist::MacroStep step{};
+                step.Command = start;
+                step.DelayMs = HotkeyPersist::SanitizeMacroDelayMs(atoi(FGUI::MacroDelayInput));
+                steps.push_back(std::move(step));
+            }
+
+            if (!steps.empty())
+            {
+                const int vk = (FGUI::PendingCommandVK > 0 && FGUI::PendingCommandVK <= 254) ? FGUI::PendingCommandVK : 0;
+
+                if (steps.size() == 1)
+                {
+                    HotkeyPersist::CommandBind command{};
+                    command.Command = std::move(steps[0].Command);
+                    command.VK = vk;
+                    command.DefaultVK = vk;
+                    FGUI::Commands.push_back(std::move(command));
+                }
+                else
+                {
+                    HotkeyPersist::CommandMacro macro{};
+                    macro.Name = steps[0].Command;
+                    macro.VK = vk;
+                    macro.DefaultVK = vk;
+                    macro.Steps = std::move(steps);
+                    FGUI::Macros.push_back(std::move(macro));
+                }
+
+                FGUI::MacroDraftSteps.clear();
+                FGUI::CommandInput[0] = '\0';
+                FGUI::MacroDelayInput[0] = '\0';
                 FGUI::PendingCommandVK = 0;
                 FGUI::RebindingCommandIndex = -2;
                 FGUI::SaveCommands();
@@ -1277,7 +1492,7 @@ void GUI_Render()
         ImGui::Spacing();
         SectionLabel("Saved");
 
-        if (FGUI::Commands.empty())
+        if (FGUI::Commands.empty() && FGUI::Macros.empty())
         {
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.353f, 0.388f, 0.478f, 1.f));
             ImGui::TextWrapped("No saved commands.");
@@ -1327,6 +1542,7 @@ void GUI_Render()
                     else
                     {
                         FGUI::RebindingCommandIndex = i;
+                        FGUI::RebindingMacroIndex = -2;
                         FGUI::bRebinding = false;
                         FGUI::bRebindingJoin = false;
                         BeginBindCapture();
@@ -1346,6 +1562,81 @@ void GUI_Render()
                 ImGui::Separator();
                 ImGui::PopID();
             }
+
+            ImGui::PushID("macros");
+            for (int i = 0; i < (int)FGUI::Macros.size(); i++)
+            {
+                auto& macro = FGUI::Macros[i];
+                ImGui::PushID(i);
+
+                for (size_t stepIndex = 0; stepIndex < macro.Steps.size(); stepIndex++)
+                {
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.847f, 0.878f, 0.941f, 1.f));
+                    ImGui::TextWrapped("%s", macro.Steps[stepIndex].Command.c_str());
+                    ImGui::PopStyleColor();
+
+                    if (stepIndex + 1 < macro.Steps.size())
+                    {
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.353f, 0.388f, 0.478f, 1.f));
+                        ImGui::Text("    wait %d ms", macro.Steps[stepIndex].DelayMs);
+                        ImGui::PopStyleColor();
+                    }
+                }
+
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.353f, 0.388f, 0.478f, 1.f));
+                ImGui::Text("Key: %s", BindName(macro.VK));
+                ImGui::PopStyleColor();
+
+                const float MacroButtonW = (CW - ImGui::GetStyle().ItemSpacing.x * 2.f) / 3.f;
+                if (ImGui::Button("Run", ImVec2(MacroButtonW, 0.f)))
+                    QueueMacro(macro);
+                ImGui::SameLine();
+
+                char macroBindLabel[64];
+                if (FGUI::RebindingMacroIndex == i)
+                    snprintf(macroBindLabel, sizeof(macroBindLabel), "Press key...");
+                else if (macro.VK > 0 && macro.VK <= 254)
+                    snprintf(macroBindLabel, sizeof(macroBindLabel), "Unbind");
+                else
+                    snprintf(macroBindLabel, sizeof(macroBindLabel), "Bind");
+
+                if (ImGui::Button(macroBindLabel, ImVec2(MacroButtonW, 0.f)))
+                {
+                    if (FGUI::RebindingMacroIndex == i)
+                    {
+                        FGUI::RebindingMacroIndex = -2;
+                        EndBindCapture();
+                    }
+                    else if (macro.VK > 0 && macro.VK <= 254)
+                    {
+                        macro.VK = 0;
+                        FGUI::RebindingMacroIndex = -2;
+                        FGUI::SaveMacros();
+                    }
+                    else
+                    {
+                        FGUI::RebindingMacroIndex = i;
+                        FGUI::RebindingCommandIndex = -2;
+                        FGUI::bRebinding = false;
+                        FGUI::bRebindingJoin = false;
+                        BeginBindCapture();
+                    }
+                }
+                ImGui::SameLine();
+
+                if (ImGui::Button("Delete", ImVec2(MacroButtonW, 0.f)))
+                {
+                    FGUI::Macros.erase(FGUI::Macros.begin() + i);
+                    FGUI::RebindingMacroIndex = -2;
+                    FGUI::SaveMacros();
+                    ImGui::PopID();
+                    break;
+                }
+
+                ImGui::Separator();
+                ImGui::PopID();
+            }
+            ImGui::PopID();
         }
 
         break;
@@ -1368,6 +1659,7 @@ void GUI_Render()
             FGUI::bRebinding = true;
             FGUI::bRebindingJoin = false;
             FGUI::RebindingCommandIndex = -2;
+            FGUI::RebindingMacroIndex = -2;
             BeginBindCapture();
         }
     }
@@ -1388,6 +1680,7 @@ void GUI_Render()
             FGUI::bRebindingJoin = true;
             FGUI::bRebinding = false;
             FGUI::RebindingCommandIndex = -2;
+            FGUI::RebindingMacroIndex = -2;
             BeginBindCapture();
         }
     }
@@ -1400,7 +1693,7 @@ void GUI_Render()
 
     ImGui::Spacing();
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.353f, 0.388f, 0.478f, 1.f));
-    ImGui::TextWrapped("Hotkeys and command binds are saved automatically. Reset All restores default hotkeys and deletes saved commands.");
+    ImGui::TextWrapped("Hotkeys, command binds, and macros are saved automatically. Reset All restores default hotkeys and deletes saved commands and macros.");
     ImGui::PopStyleColor();
 
         ImGui::Dummy(ImVec2(0.f, 8.f));

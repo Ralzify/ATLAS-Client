@@ -42,6 +42,11 @@ struct FGUI
     static inline int PendingCommandVK = 0;
     static inline int RebindingCommandIndex = -2; // -1 = new command bind, >=0 = saved command, -2 = none
 
+    static inline std::vector<HotkeyPersist::CommandMacro> Macros;
+    static inline std::vector<HotkeyPersist::MacroStep> MacroDraftSteps;
+    static inline char MacroDelayInput[8] = "";
+    static inline int RebindingMacroIndex = -2; // >=0 = saved macro being rebound, -2 = none
+
     static void SaveHotkey();
     static void LoadHotkey();
 
@@ -50,6 +55,8 @@ struct FGUI
 
     static void SaveCommands();
     static void LoadCommands();
+    static void SaveMacros();
+    static void LoadMacros();
     static void ResetAll();
 };
 
