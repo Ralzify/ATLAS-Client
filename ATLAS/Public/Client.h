@@ -21,4 +21,8 @@ class Client
 {
 public:
     static void Init();
+    static void SetConsoleCaptureEnabled(bool enabled);
+    static bool IsConsoleCaptureReady();
+    static bool HasReceivedServerCommandList();
+    static uint64_t GetConsoleSessionGeneration();
 };

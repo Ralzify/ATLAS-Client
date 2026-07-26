@@ -6,12 +6,17 @@
 #include "../Public/Diagnostics.h"
 #include "../Public/Icon.h"
 #include "../ImGui/imgui.h"
+#include "../ImGui/imgui_stdlib.h"
 
 #include <sstream>
 #include <iomanip>
 #include <array>
 #include <atomic>
+#include <cctype>
+#include <cmath>
 #include <deque>
+#include <mutex>
+#include <unordered_set>
 #include <vector>
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -28,6 +33,273 @@ extern void* SelectReset(void*);
 
 static ImVec4 Accent(float a = 1.f) { return ImVec4(ACCENT_R, ACCENT_G, ACCENT_B, a); }
 static ImVec4 AccentDk(float a = 1.f) { return ImVec4(0.f, 0.38f, 0.50f, a); }
+
+enum class EConsoleLineKind : uint8_t
+{
+    Output,
+    Command,
+    System,
+    Error
+};
+
+struct FConsoleLine
+{
+    uint64_t Id = 0;
+    EConsoleLineKind Kind = EConsoleLineKind::Output;
+    std::string Time;
+    std::string Text;
+};
+
+struct FConsoleUiState
+{
+    std::string Input;
+    std::string Draft;
+    std::vector<std::string> History;
+    int HistoryPosition = -1;
+    std::string CompletionSeed;
+    std::vector<std::string> CompletionMatches;
+    int CompletionPosition = -1;
+    bool FocusInput = false;
+    bool ScrollToBottom = false;
+    bool WasAtBottom = true;
+    bool WindowFocused = false;
+    bool Expanded = false;
+    bool ResetExpansion = false;
+    float Expansion = 0.f;
+    bool InitialHelpPending = false;
+    bool InitialHelpRequested = false;
+    uint64_t InitialHelpSession = 0;
+    unsigned int InitialHelpAttempts = 0;
+    ULONGLONG NextInitialHelpAttemptAt = 0;
+};
+
+static FConsoleUiState g_ConsoleUi;
+static std::deque<FConsoleLine> g_ConsoleLines;
+static size_t g_ConsoleLineBytes = 0;
+static uint64_t g_NextConsoleLineId = 1;
+static uint64_t g_ConsoleLineRevision = 0;
+
+static std::mutex g_ConsolePendingMutex;
+static std::deque<std::string> g_ConsolePending;
+static size_t g_ConsolePendingBytes = 0;
+static std::atomic_uint g_ConsoleDroppedMessages = 0;
+static std::string g_ConsoleDrainCarry;
+static size_t g_ConsoleDrainOffset = 0;
+static bool g_FocusMenuWindow = false;
+static bool g_MenuWindowFocused = false;
+static ULONGLONG g_BindErrorUntil = 0;
+static std::string g_BindError;
+
+static constexpr size_t kMaximumConsoleLines = 2048;
+static constexpr size_t kMaximumConsoleBytes = 1024 * 1024;
+static constexpr size_t kMaximumPendingMessages = 256;
+static constexpr size_t kMaximumPendingBytes = 512 * 1024;
+static constexpr size_t kMaximumConsoleLineLength = 4096;
+static constexpr size_t kMaximumConsoleHistory = 100;
+static constexpr size_t kMaximumConsoleCommandLength = 2048;
+static constexpr size_t kMaximumDrainLinesPerFrame = 256;
+static constexpr size_t kMaximumDrainBytesPerFrame = 64 * 1024;
+static constexpr unsigned int kMaximumInitialHelpAttempts = 3;
+static constexpr ULONGLONG kInitialHelpRetryMs = 5000;
+
+static bool IsUnrealConsoleHotkey(int vk)
+{
+    // Both characters produced by the Tilde key arrive as VK_OEM_3. F8 is
+    // ATLAS's second fixed alias for the same UE-style console cycle.
+    return vk == VK_OEM_3 || vk == VK_F8;
+}
+
+bool GUI_IsOverlayVisible()
+{
+    return FGUI::bVisible || FGUI::bConsoleVisible;
+}
+
+static bool ContainsInsensitive(const std::string& value, const char* needle)
+{
+    if (!needle || !*needle)
+        return true;
+
+    const size_t needleLength = strlen(needle);
+    if (needleLength > value.size())
+        return false;
+
+    for (size_t start = 0; start + needleLength <= value.size(); start++)
+    {
+        size_t i = 0;
+        for (; i < needleLength; i++)
+        {
+            const unsigned char left = static_cast<unsigned char>(value[start + i]);
+            const unsigned char right = static_cast<unsigned char>(needle[i]);
+            if (std::tolower(left) != std::tolower(right))
+                break;
+        }
+        if (i == needleLength)
+            return true;
+    }
+
+    return false;
+}
+
+static bool StartsWithInsensitive(const std::string& value, const std::string& prefix)
+{
+    if (prefix.size() > value.size())
+        return false;
+
+    for (size_t i = 0; i < prefix.size(); i++)
+    {
+        const unsigned char left = static_cast<unsigned char>(value[i]);
+        const unsigned char right = static_cast<unsigned char>(prefix[i]);
+        if (std::tolower(left) != std::tolower(right))
+            return false;
+    }
+
+    return true;
+}
+
+static EConsoleLineKind ClassifyConsoleOutput(const std::string& text)
+{
+    if (StartsWithInsensitive(text, "[ATLAS]"))
+        return EConsoleLineKind::System;
+
+    static const char* kErrorWords[] = {
+        "could not", "failed", "invalid", "wrong number", "error", "no player",
+        "not found", "unavailable", "queue full"
+    };
+
+    for (const char* word : kErrorWords)
+        if (ContainsInsensitive(text, word))
+            return EConsoleLineKind::Error;
+
+    return EConsoleLineKind::Output;
+}
+
+static void AppendConsoleLine(EConsoleLineKind kind, std::string text)
+{
+    while (!text.empty() && (text.back() == '\r' || text.back() == '\n' || text.back() == '\0'))
+        text.pop_back();
+
+    if (text.empty())
+        return;
+
+    if (text.size() > kMaximumConsoleLineLength)
+    {
+        text.resize(kMaximumConsoleLineLength - 14);
+        text += " ...[truncated]";
+    }
+
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+    char timestamp[16]{};
+    snprintf(timestamp, sizeof(timestamp), "%02u:%02u:%02u", now.wHour, now.wMinute, now.wSecond);
+
+    FConsoleLine line{};
+    line.Id = g_NextConsoleLineId++;
+    line.Kind = kind;
+    line.Time = timestamp;
+    line.Text = std::move(text);
+    g_ConsoleLineBytes += line.Time.size() + line.Text.size();
+    g_ConsoleLines.push_back(std::move(line));
+
+    while (!g_ConsoleLines.empty() &&
+        (g_ConsoleLines.size() > kMaximumConsoleLines || g_ConsoleLineBytes > kMaximumConsoleBytes))
+    {
+        g_ConsoleLineBytes -= g_ConsoleLines.front().Time.size() + g_ConsoleLines.front().Text.size();
+        g_ConsoleLines.pop_front();
+    }
+
+    g_ConsoleLineRevision++;
+}
+
+bool GUI_QueueConsoleOutput(const wchar_t* text, int length)
+{
+    if (!text || length <= 0)
+        return false;
+
+    if (length > 16384)
+        length = 16384;
+
+    // Reserve access before converting. Once the bounded queue is saturated,
+    // producers drop immediately instead of repeatedly allocating and doing
+    // UTF conversion on the gameplay/RPC thread.
+    std::unique_lock<std::mutex> lock(g_ConsolePendingMutex, std::try_to_lock);
+    const size_t minimumUtf8Bytes = static_cast<size_t>(length);
+    if (!lock.owns_lock() ||
+        g_ConsolePending.size() >= kMaximumPendingMessages ||
+        g_ConsolePendingBytes >= kMaximumPendingBytes ||
+        minimumUtf8Bytes > kMaximumPendingBytes - g_ConsolePendingBytes)
+    {
+        g_ConsoleDroppedMessages.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+
+    const int utf8Length = WideCharToMultiByte(CP_UTF8, 0, text, length, nullptr, 0, nullptr, nullptr);
+    if (utf8Length <= 0)
+        return false;
+
+    std::string utf8(static_cast<size_t>(utf8Length), '\0');
+    if (WideCharToMultiByte(CP_UTF8, 0, text, length, utf8.data(), utf8Length, nullptr, nullptr) != utf8Length)
+        return false;
+
+    if (utf8.size() > kMaximumPendingBytes - g_ConsolePendingBytes)
+    {
+        g_ConsoleDroppedMessages.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+
+    g_ConsolePendingBytes += utf8.size();
+    g_ConsolePending.push_back(std::move(utf8));
+    return true;
+}
+
+static void DrainConsoleOutput()
+{
+    const unsigned int dropped = g_ConsoleDroppedMessages.exchange(0, std::memory_order_acq_rel);
+    if (dropped > 0)
+    {
+        char message[128]{};
+        snprintf(message, sizeof(message), "[ATLAS] Dropped %u output message%s to protect frame time.",
+            dropped, dropped == 1 ? "" : "s");
+        AppendConsoleLine(EConsoleLineKind::System, message);
+    }
+
+    size_t lineCount = 0;
+    size_t byteCount = 0;
+    while (lineCount < kMaximumDrainLinesPerFrame &&
+        byteCount < kMaximumDrainBytesPerFrame)
+    {
+        if (g_ConsoleDrainOffset >= g_ConsoleDrainCarry.size())
+        {
+            g_ConsoleDrainCarry.clear();
+            g_ConsoleDrainOffset = 0;
+
+            std::lock_guard<std::mutex> lock(g_ConsolePendingMutex);
+            if (g_ConsolePending.empty())
+                break;
+
+            g_ConsolePendingBytes -= g_ConsolePending.front().size();
+            g_ConsoleDrainCarry = std::move(g_ConsolePending.front());
+            g_ConsolePending.pop_front();
+        }
+
+        const size_t end = g_ConsoleDrainCarry.find('\n', g_ConsoleDrainOffset);
+        const size_t lineEnd = end == std::string::npos ? g_ConsoleDrainCarry.size() : end;
+        const size_t consumedBytes = lineEnd - g_ConsoleDrainOffset +
+            (end == std::string::npos ? 0 : 1);
+
+        if (lineCount > 0 && consumedBytes > kMaximumDrainBytesPerFrame - byteCount)
+            break;
+
+        std::string line = g_ConsoleDrainCarry.substr(
+            g_ConsoleDrainOffset, lineEnd - g_ConsoleDrainOffset);
+        AppendConsoleLine(ClassifyConsoleOutput(line), std::move(line));
+
+        lineCount++;
+        byteCount += consumedBytes;
+        g_ConsoleDrainOffset = end == std::string::npos
+            ? g_ConsoleDrainCarry.size()
+            : end + 1;
+    }
+}
 
 static const char* VKName(int vk)
 {
@@ -144,6 +416,8 @@ void FGUI::ResetAll()
 {
     FGUI::HotkeyVK = VK_F9;
     FGUI::JoinHotkeyVK = VK_F5;
+    FConfiguration::ConsoleMode.store(
+        static_cast<int>(EConsoleMode::Atlas), std::memory_order_release);
     FGUI::bRebinding = false;
     FGUI::bRebindingJoin = false;
     FGUI::RebindingCommandIndex = -2;
@@ -156,7 +430,8 @@ void FGUI::ResetAll()
     FGUI::MacroDraftSteps.clear();
     RefreshExclusiveCommandHotkeys();
 
-    HotkeyPersist::SaveAll(FGUI::HotkeyVK, FGUI::JoinHotkeyVK, {}, {});
+    HotkeyPersist::SaveAll(FGUI::HotkeyVK, FGUI::JoinHotkeyVK,
+        static_cast<int>(EConsoleMode::Atlas), {}, {});
 }
 
 void GUI_LoadTextures(ID3D11Device* device)
@@ -584,32 +859,52 @@ static bool SidebarTab(const char* label, int index, float height)
     return pressed;
 }
 
-static void ExecNow(const char* cmd)
+static void QueueCommandError(const wchar_t* message)
+{
+    if (!message || !*message)
+        return;
+
+    GUI_QueueConsoleOutput(message, static_cast<int>(wcslen(message)));
+}
+
+static bool ExecNow(const char* cmd, bool showConsoleErrors = true)
 {
     if (!cmd || !*cmd)
-        return;
+        return false;
 
     auto world = UWorld::GetWorld();
     if (!world || !world->OwningGameInstance)
     {
         AtlasDiagnostics::WriteLine("command-skip no-world command=%s", cmd);
-        return;
+        if (showConsoleErrors)
+            QueueCommandError(L"Command error: no active Unreal world.");
+        return false;
     }
 
     auto& localPlayers = world->OwningGameInstance->LocalPlayers;
     if (localPlayers.Num() == 0 || !localPlayers[0] || !localPlayers[0]->PlayerController)
     {
         AtlasDiagnostics::WriteLine("command-skip no-player command=%s", cmd);
-        return;
+        if (showConsoleErrors)
+            QueueCommandError(L"Command error: no local player controller.");
+        return false;
     }
 
     const int len = MultiByteToWideChar(CP_UTF8, 0, cmd, -1, nullptr, 0);
     if (len <= 1)
-        return;
+    {
+        if (showConsoleErrors)
+            QueueCommandError(L"Command error: invalid UTF-8 input.");
+        return false;
+    }
 
     std::wstring wide(static_cast<size_t>(len), L'\0');
     if (MultiByteToWideChar(CP_UTF8, 0, cmd, -1, wide.data(), len) != len)
-        return;
+    {
+        if (showConsoleErrors)
+            QueueCommandError(L"Command error: input conversion failed.");
+        return false;
+    }
     wide.resize(static_cast<size_t>(len - 1));
 
     FString command(wide.c_str());
@@ -617,10 +912,111 @@ static void ExecNow(const char* cmd)
     UKismetSystemLibrary::ExecuteConsoleCommand(localPlayers[0]->PlayerController, command);
     AtlasDiagnostics::WriteLine("command-return command=%s", cmd);
     command.Free();
+    return true;
+}
+
+struct FGameThreadCommand
+{
+    std::string Command;
+    bool ShowConsoleErrors = true;
+};
+
+// Present owns the UI scheduler, while Unreal command execution must happen
+// on the game thread. A one-item mailbox provides strict backpressure: rapid
+// binds may fill the regular bounded queue, but they can never re-enter
+// ProcessEvent or build an unbounded game-thread backlog.
+static std::mutex g_GameThreadCommandMutex;
+static std::deque<FGameThreadCommand> g_GameThreadCommands;
+static std::atomic_bool g_GameThreadDispatcherReady = false;
+static std::atomic_bool g_GameThreadCommandExecuting = false;
+static std::atomic<ULONGLONG> g_GameThreadCommandReadyAfter = 0;
+static constexpr size_t kMaximumGameThreadCommands = 1;
+static constexpr ULONGLONG kGameThreadCommandSettleMs = 100;
+
+void GUI_SetGameThreadDispatcherReady(bool ready)
+{
+    g_GameThreadDispatcherReady.store(ready, std::memory_order_release);
+    if (ready)
+        return;
+
+    g_GameThreadCommandReadyAfter.store(
+        0, std::memory_order_release);
+    std::unique_lock<std::mutex> lock(
+        g_GameThreadCommandMutex, std::try_to_lock);
+    if (lock.owns_lock())
+        g_GameThreadCommands.clear();
+}
+
+static bool HandOffGameThreadCommand(
+    const std::string& command,
+    bool showConsoleErrors = true)
+{
+    if (command.empty() ||
+        !g_GameThreadDispatcherReady.load(std::memory_order_acquire) ||
+        g_GameThreadCommandExecuting.load(std::memory_order_acquire) ||
+        GetTickCount64() <
+            g_GameThreadCommandReadyAfter.load(
+                std::memory_order_acquire))
+    {
+        return false;
+    }
+
+    std::unique_lock<std::mutex> lock(
+        g_GameThreadCommandMutex, std::try_to_lock);
+    if (!lock.owns_lock() ||
+        g_GameThreadCommandExecuting.load(std::memory_order_acquire) ||
+        g_GameThreadCommands.size() >= kMaximumGameThreadCommands)
+    {
+        return false;
+    }
+
+    g_GameThreadCommands.push_back(
+        FGameThreadCommand{ command, showConsoleErrors });
+    AtlasDiagnostics::WriteLine(
+        "command-handoff depth=%zu command=%s",
+        g_GameThreadCommands.size(), command.c_str());
+    return true;
+}
+
+void GUI_PumpGameThreadCommands()
+{
+    bool expected = false;
+    if (!g_GameThreadCommandExecuting.compare_exchange_strong(
+        expected, true, std::memory_order_acq_rel,
+        std::memory_order_acquire))
+    {
+        return;
+    }
+
+    FGameThreadCommand pending{};
+    {
+        std::unique_lock<std::mutex> lock(
+            g_GameThreadCommandMutex, std::try_to_lock);
+        if (!lock.owns_lock() || g_GameThreadCommands.empty())
+        {
+            g_GameThreadCommandExecuting.store(
+                false, std::memory_order_release);
+            return;
+        }
+
+        pending = std::move(g_GameThreadCommands.front());
+        g_GameThreadCommands.pop_front();
+    }
+
+    // Do not hold the mailbox, ImGui, or render mutex across ProcessEvent.
+    ExecNow(
+        pending.Command.c_str(),
+        pending.ShowConsoleErrors);
+    g_GameThreadCommandReadyAfter.store(
+        GetTickCount64() + kGameThreadCommandSettleMs,
+        std::memory_order_release);
+    g_GameThreadCommandExecuting.store(
+        false, std::memory_order_release);
 }
 
 static std::deque<std::string> g_CommandQueue;
 static ULONGLONG g_LastCommandDispatch = 0;
+static bool g_LastScheduledCommandWasMacro = false;
 static constexpr ULONGLONG kMinimumCommandIntervalMs = 100;
 static constexpr size_t kMaximumQueuedMacroRuns = 8;
 
@@ -634,10 +1030,17 @@ struct QueuedMacroRun
 
 static std::deque<QueuedMacroRun> g_MacroRunQueue;
 
-static void Exec(const char* cmd)
+static bool Exec(const char* cmd)
 {
     if (!cmd || !*cmd)
-        return;
+        return false;
+
+    if (!g_GameThreadDispatcherReady.load(std::memory_order_acquire))
+    {
+        AtlasDiagnostics::WriteLine(
+            "command-drop dispatcher-unavailable command=%s", cmd);
+        return false;
+    }
 
     // Slider updates only need the newest FOV value; allowing old values to
     // accumulate would delay later commands unnecessarily.
@@ -656,11 +1059,11 @@ static void Exec(const char* cmd)
     {
         g_CommandQueue.emplace_back(cmd);
         AtlasDiagnostics::WriteLine("command-enqueue depth=%zu command=%s", g_CommandQueue.size(), cmd);
+        return true;
     }
-    else
-    {
-        AtlasDiagnostics::WriteLine("command-drop queue-full command=%s", cmd);
-    }
+
+    AtlasDiagnostics::WriteLine("command-drop queue-full command=%s", cmd);
+    return false;
 }
 
 static void QueueMacro(const HotkeyPersist::CommandMacro& macro)
@@ -696,49 +1099,156 @@ static void QueueMacro(const HotkeyPersist::CommandMacro& macro)
         macro.Name.c_str(), macro.Steps.size());
 }
 
+static void RefreshInitialHelpSession(bool armIfVisible)
+{
+    const uint64_t session = Client::GetConsoleSessionGeneration();
+    if (session != g_ConsoleUi.InitialHelpSession)
+    {
+        g_ConsoleUi.InitialHelpSession = session;
+        g_ConsoleUi.InitialHelpRequested = false;
+        g_ConsoleUi.InitialHelpPending = false;
+        g_ConsoleUi.InitialHelpAttempts = 0;
+        g_ConsoleUi.NextInitialHelpAttemptAt = 0;
+    }
+
+    if (armIfVisible && session != 0 &&
+        !Client::HasReceivedServerCommandList() &&
+        !g_ConsoleUi.InitialHelpRequested)
+    {
+        g_ConsoleUi.InitialHelpRequested = true;
+        g_ConsoleUi.InitialHelpPending = true;
+        g_ConsoleUi.InitialHelpAttempts = 0;
+        g_ConsoleUi.NextInitialHelpAttemptAt = 0;
+    }
+}
+
 static void DispatchQueuedCommand()
 {
+    RefreshInitialHelpSession(
+        FGUI::bConsoleVisible.load(std::memory_order_acquire));
+
     const ULONGLONG now = GetTickCount64();
     if (g_LastCommandDispatch != 0 && now - g_LastCommandDispatch < kMinimumCommandIntervalMs)
         return;
 
-    // Run each macro in sequence. The next delay is measured from the actual
-    // dispatch time, so frame hitches cannot collapse multiple commands into
-    // one unsafe burst.
-    if (!g_MacroRunQueue.empty())
+    if (g_ConsoleUi.InitialHelpPending &&
+        Client::HasReceivedServerCommandList())
     {
+        g_ConsoleUi.InitialHelpPending = false;
+    }
+
+    if (g_ConsoleUi.InitialHelpPending &&
+        g_ConsoleUi.InitialHelpAttempts >=
+            kMaximumInitialHelpAttempts)
+    {
+        g_ConsoleUi.InitialHelpPending = false;
+    }
+
+    while (!g_MacroRunQueue.empty() &&
+        g_MacroRunQueue.front().NextStep >=
+            g_MacroRunQueue.front().Steps.size())
+    {
+        g_MacroRunQueue.pop_front();
+    }
+
+    const bool macroDue =
+        !g_MacroRunQueue.empty() &&
+        (g_MacroRunQueue.front().NextDispatchAt == 0 ||
+            now >= g_MacroRunQueue.front().NextDispatchAt);
+
+    auto dispatchRegular = [&]() -> bool
+    {
+        if (g_CommandQueue.empty())
+            return false;
+
+        const std::string& command = g_CommandQueue.front();
+        if (!HandOffGameThreadCommand(command))
+            return false;
+
+        g_CommandQueue.pop_front();
+        g_LastCommandDispatch = now;
+        g_LastScheduledCommandWasMacro = false;
+        return true;
+    };
+
+    auto dispatchMacro = [&]() -> bool
+    {
+        if (!macroDue || g_MacroRunQueue.empty())
+            return false;
+
         auto& run = g_MacroRunQueue.front();
-        if (run.NextDispatchAt != 0 && now < run.NextDispatchAt)
-            return;
+        const HotkeyPersist::MacroStep step =
+            run.Steps[run.NextStep];
+        if (!HandOffGameThreadCommand(step.Command))
+            return false;
 
-        if (run.NextStep >= run.Steps.size())
-        {
-            g_MacroRunQueue.pop_front();
-            return;
-        }
-
-        HotkeyPersist::MacroStep step = run.Steps[run.NextStep++];
-        const bool completed = run.NextStep >= run.Steps.size();
+        run.NextStep++;
+        const bool completed =
+            run.NextStep >= run.Steps.size();
         const std::string macroName = run.Name;
         const size_t stepNumber = run.NextStep;
         if (completed)
+        {
             g_MacroRunQueue.pop_front();
+        }
         else
-            run.NextDispatchAt = now + static_cast<ULONGLONG>(HotkeyPersist::SanitizeMacroDelayMs(step.DelayMs));
+        {
+            run.NextDispatchAt =
+                now + static_cast<ULONGLONG>(
+                    HotkeyPersist::SanitizeMacroDelayMs(
+                        step.DelayMs));
+        }
 
         g_LastCommandDispatch = now;
-        AtlasDiagnostics::WriteLine("macro-dispatch macro=%s step=%zu command=%s", macroName.c_str(), stepNumber, step.Command.c_str());
-        ExecNow(step.Command.c_str());
+        g_LastScheduledCommandWasMacro = true;
+        AtlasDiagnostics::WriteLine(
+            "macro-dispatch macro=%s step=%zu command=%s",
+            macroName.c_str(), stepNumber,
+            step.Command.c_str());
+        return true;
+    };
+
+    // Alternate when both queues are ready. A delayed macro no longer blocks
+    // ordinary commands for up to 60 seconds, and a macro burst cannot starve
+    // direct console or saved-bind commands.
+    if (!g_CommandQueue.empty() &&
+        (!macroDue || g_LastScheduledCommandWasMacro))
+    {
+        if (dispatchRegular())
+            return;
         return;
     }
 
-    if (g_CommandQueue.empty())
+    if (macroDue)
+    {
+        if (dispatchMacro())
+            return;
         return;
+    }
 
-    std::string command = std::move(g_CommandQueue.front());
-    g_CommandQueue.pop_front();
-    g_LastCommandDispatch = now;
-    ExecNow(command.c_str());
+    if (!g_CommandQueue.empty())
+    {
+        if (dispatchRegular())
+            return;
+        return;
+    }
+
+    // Help discovery is intentionally lowest priority and is requested only
+    // once per world/controller session. It cannot repeatedly flood the
+    // server merely because the console was reopened before detection latched.
+    if (g_ConsoleUi.InitialHelpPending &&
+        Client::IsConsoleCaptureReady() &&
+        now >= g_ConsoleUi.NextInitialHelpAttemptAt &&
+        HandOffGameThreadCommand("cheat", false))
+    {
+        g_ConsoleUi.InitialHelpAttempts++;
+        g_ConsoleUi.NextInitialHelpAttemptAt =
+            now + kInitialHelpRetryMs;
+        g_LastCommandDispatch = now;
+        g_LastScheduledCommandWasMacro = false;
+        AtlasDiagnostics::WriteLine(
+            "console-help-dispatch command=cheat");
+    }
 }
 
 static void ClearQueuedCommands()
@@ -750,23 +1260,12 @@ static void ClearQueuedCommands()
     g_CommandQueue.clear();
     g_MacroRunQueue.clear();
     g_LastCommandDispatch = 0;
-}
+    g_LastScheduledCommandWasMacro = false;
 
-static void SpawnConsole()
-{
-    auto engine = UEngine::GetEngine();
-    if (engine && engine->GameViewport && engine->ConsoleClass)
-        engine->GameViewport->ViewportConsole = UGameplayStatics::SpawnObject(engine->ConsoleClass, engine->GameViewport);
-}
-
-static void DestroyConsole()
-{
-    auto engine = UEngine::GetEngine();
-    if (!engine || !engine->GameViewport || !engine->GameViewport->ViewportConsole)
-        return;
-
-    engine->GameViewport->ViewportConsole->ObjectFlags |= 0x4;
-    engine->GameViewport->ViewportConsole = nullptr;
+    std::unique_lock<std::mutex> lock(
+        g_GameThreadCommandMutex, std::try_to_lock);
+    if (lock.owns_lock())
+        g_GameThreadCommands.clear();
 }
 
 static void JoinSelectedHost()
@@ -793,6 +1292,100 @@ void GUI_Init()
     FGUI::LoadJoinHotkey();
     FGUI::LoadCommands();
     FGUI::LoadMacros();
+
+    const int consoleMode = HotkeyPersist::LoadConsoleMode();
+    FConfiguration::ConsoleMode.store(consoleMode, std::memory_order_release);
+
+    const bool hadLegacyConsoleHotkey =
+        HotkeyPersist::HasLegacyConsoleHotkey();
+    const int legacyConsoleHotkey =
+        hadLegacyConsoleHotkey
+            ? HotkeyPersist::LoadLegacyConsoleHotkey()
+            : 0;
+    bool migratedSettings = hadLegacyConsoleHotkey;
+    int menuHotkey = FGUI::HotkeyVK.load(std::memory_order_acquire);
+    int joinHotkey = FGUI::JoinHotkeyVK.load(std::memory_order_acquire);
+
+    if (IsUnrealConsoleHotkey(menuHotkey))
+    {
+        static const int menuFallbacks[] = { VK_F9, VK_F10, VK_F11, VK_F12 };
+        for (int fallback : menuFallbacks)
+        {
+            if (fallback != joinHotkey && !IsUnrealConsoleHotkey(fallback))
+            {
+                menuHotkey = fallback;
+                FGUI::HotkeyVK.store(menuHotkey, std::memory_order_release);
+                migratedSettings = true;
+                break;
+            }
+        }
+    }
+
+    // v1.1 temporarily moved Join from F5 to F6 to make room for a separate
+    // console bind. The enhanced console now uses F8 and Unreal's native
+    // ` / ~ key, so migrate that generated setting back to F5.
+    if (legacyConsoleHotkey == VK_F5 && joinHotkey == VK_F6)
+    {
+        joinHotkey = VK_F5;
+        FGUI::JoinHotkeyVK.store(joinHotkey, std::memory_order_release);
+    }
+
+    if (joinHotkey == menuHotkey || IsUnrealConsoleHotkey(joinHotkey))
+    {
+        static const int fallbacks[] = {
+            VK_F5, VK_F6, VK_F7, VK_F10, VK_F11, VK_F12
+        };
+        for (int fallback : fallbacks)
+        {
+            if (fallback != menuHotkey &&
+                !IsUnrealConsoleHotkey(fallback))
+            {
+                joinHotkey = fallback;
+                FGUI::JoinHotkeyVK.store(joinHotkey, std::memory_order_release);
+                migratedSettings = true;
+                break;
+            }
+        }
+    }
+
+    size_t unboundActionCount = 0;
+    auto conflictsWithOverlay = [menuHotkey, joinHotkey](int vk)
+    {
+        return vk > 0 &&
+            (vk == menuHotkey || vk == joinHotkey ||
+                IsUnrealConsoleHotkey(vk));
+    };
+    for (auto& command : FGUI::Commands)
+    {
+        if (conflictsWithOverlay(command.VK))
+        {
+            command.VK = 0;
+            unboundActionCount++;
+        }
+    }
+    for (auto& macro : FGUI::Macros)
+    {
+        if (conflictsWithOverlay(macro.VK))
+        {
+            macro.VK = 0;
+            unboundActionCount++;
+        }
+    }
+    migratedSettings = migratedSettings || unboundActionCount > 0;
+
+    if (migratedSettings)
+    {
+        HotkeyPersist::SaveAll(menuHotkey, joinHotkey, consoleMode,
+            FGUI::Commands, FGUI::Macros);
+        RefreshExclusiveCommandHotkeys();
+    }
+
+    if (unboundActionCount > 0)
+    {
+        AtlasDiagnostics::WriteLine(
+            "settings-migration unbound-console-conflicts=%zu",
+            unboundActionCount);
+    }
     PushStyle();
 }
 
@@ -873,31 +1466,29 @@ static bool IsExclusiveCommandHotkey(int vk)
         g_ExclusiveCommandHotkeys[static_cast<size_t>(vk)].load(std::memory_order_acquire);
 }
 
-bool GUI_ShouldConsumeInputMessage(UINT message, WPARAM wParam)
+static bool IsAtlasConsoleSelected()
 {
-    return IsExclusiveCommandHotkey(InputMessageVK(message, wParam));
+    return FConfiguration::ConsoleMode.load(std::memory_order_acquire) ==
+        static_cast<int>(EConsoleMode::Atlas);
 }
 
-bool GUI_ShouldConsumeRawInput(LPARAM lParam)
+static bool IsAtlasOwnedHotkey(int vk)
 {
-    RAWINPUT raw{};
-    UINT rawSize = sizeof(raw);
-    if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT, &raw,
-        &rawSize, sizeof(RAWINPUTHEADER)) == static_cast<UINT>(-1))
-        return false;
+    return vk > 0 && vk <= 0xFE &&
+        (vk == FGUI::HotkeyVK || vk == FGUI::JoinHotkeyVK ||
+            vk == VK_F8 ||
+            (IsAtlasConsoleSelected() && vk == VK_OEM_3) ||
+            IsExclusiveCommandHotkey(vk));
+}
 
-    if (raw.header.dwType == RIM_TYPEKEYBOARD)
-        return IsExclusiveCommandHotkey(static_cast<int>(raw.data.keyboard.VKey));
+bool GUI_IsOwnedHotkey(int vk)
+{
+    return IsAtlasOwnedHotkey(vk);
+}
 
-    if (raw.header.dwType != RIM_TYPEMOUSE)
-        return false;
-
-    const USHORT flags = raw.data.mouse.usButtonFlags;
-    return ((flags & (RI_MOUSE_BUTTON_1_DOWN | RI_MOUSE_BUTTON_1_UP)) && IsExclusiveCommandHotkey(VK_LBUTTON)) ||
-        ((flags & (RI_MOUSE_BUTTON_2_DOWN | RI_MOUSE_BUTTON_2_UP)) && IsExclusiveCommandHotkey(VK_RBUTTON)) ||
-        ((flags & (RI_MOUSE_BUTTON_3_DOWN | RI_MOUSE_BUTTON_3_UP)) && IsExclusiveCommandHotkey(VK_MBUTTON)) ||
-        ((flags & (RI_MOUSE_BUTTON_4_DOWN | RI_MOUSE_BUTTON_4_UP)) && IsExclusiveCommandHotkey(VK_XBUTTON1)) ||
-        ((flags & (RI_MOUSE_BUTTON_5_DOWN | RI_MOUSE_BUTTON_5_UP)) && IsExclusiveCommandHotkey(VK_XBUTTON2));
+bool GUI_ShouldConsumeInputMessage(UINT message, WPARAM wParam)
+{
+    return IsAtlasOwnedHotkey(InputMessageVK(message, wParam));
 }
 
 void GUI_QueueInputMessage(UINT message, WPARAM wParam, LPARAM lParam)
@@ -969,6 +1560,48 @@ static void EndBindCapture()
     ClearInputQueue();
 }
 
+static void CancelBindCapture()
+{
+    FGUI::bRebinding = false;
+    FGUI::bRebindingJoin = false;
+    FGUI::RebindingCommandIndex = -2;
+    FGUI::RebindingMacroIndex = -2;
+    FGUI::PendingCommandVK = 0;
+    EndBindCapture();
+}
+
+static void CloseMenuSurface()
+{
+    FGUI::bVisible.store(false, std::memory_order_release);
+    g_MenuWindowFocused = false;
+    CancelBindCapture();
+    if (FGUI::bConsoleVisible.load(std::memory_order_acquire))
+        g_ConsoleUi.FocusInput = true;
+}
+
+static void CloseConsoleSurface()
+{
+    FGUI::bConsoleVisible.store(false, std::memory_order_release);
+    g_ConsoleUi.WindowFocused = false;
+    g_ConsoleUi.HistoryPosition = -1;
+    g_ConsoleUi.Draft.clear();
+    g_ConsoleUi.CompletionMatches.clear();
+    g_ConsoleUi.CompletionPosition = -1;
+    if (FGUI::bVisible.load(std::memory_order_acquire))
+        g_FocusMenuWindow = true;
+}
+
+static bool DismissConsoleHistory()
+{
+    if (g_ConsoleUi.HistoryPosition < 0)
+        return false;
+
+    g_ConsoleUi.HistoryPosition = -1;
+    g_ConsoleUi.Draft.clear();
+    g_ConsoleUi.FocusInput = true;
+    return true;
+}
+
 static int PollBindKey(const InputPressCounts& presses)
 {
     for (int vk = 0x01; vk <= 0xFE; vk++)
@@ -976,6 +1609,31 @@ static int PollBindKey(const InputPressCounts& presses)
             return vk;
 
     return 0;
+}
+
+static void SetBindError(const char* message)
+{
+    g_BindError = message ? message : "That key is already in use.";
+    g_BindErrorUntil = GetTickCount64() + 3500;
+    AtlasDiagnostics::WriteLine("bind-rejected reason=%s", g_BindError.c_str());
+}
+
+static bool IsReservedOverlayKey(int vk, int except)
+{
+    return (except != 0 && vk == FGUI::HotkeyVK) ||
+        (except != 1 && vk == FGUI::JoinHotkeyVK) ||
+        IsUnrealConsoleHotkey(vk);
+}
+
+static bool IsSavedActionHotkey(int vk)
+{
+    for (const auto& command : FGUI::Commands)
+        if (command.VK == vk)
+            return true;
+    for (const auto& macro : FGUI::Macros)
+        if (macro.VK == vk)
+            return true;
+    return false;
 }
 
 void GUI_HandleInput(bool windowActive)
@@ -992,9 +1650,10 @@ void GUI_HandleInput(bool windowActive)
     // cheat/inventory state changes before the previous command has settled.
     DispatchQueuedCommand();
 
-    const bool wasVisible = FGUI::bVisible;
+    const bool wasOverlayVisible = GUI_IsOverlayVisible();
 
-    if ((FGUI::bRebinding || FGUI::bRebindingJoin || FGUI::RebindingCommandIndex != -2 || FGUI::RebindingMacroIndex != -2) &&
+    if ((FGUI::bRebinding || FGUI::bRebindingJoin ||
+        FGUI::RebindingCommandIndex != -2 || FGUI::RebindingMacroIndex != -2) &&
         TakePressCount(presses, VK_ESCAPE) > 0)
     {
         FGUI::bRebinding = false;
@@ -1009,10 +1668,15 @@ void GUI_HandleInput(bool windowActive)
     {
         if (int vk = PollBindKey(presses))
         {
-            FGUI::HotkeyVK = vk;
+            if (IsReservedOverlayKey(vk, 0) || IsSavedActionHotkey(vk))
+                SetBindError("That key is already assigned to another ATLAS action.");
+            else
+            {
+                FGUI::HotkeyVK = vk;
+                FGUI::SaveHotkey();
+            }
             FGUI::bRebinding = false;
             FGUI::RebindingMacroIndex = -2;
-            FGUI::SaveHotkey();
             EndBindCapture();
         }
         return;
@@ -1022,10 +1686,15 @@ void GUI_HandleInput(bool windowActive)
     {
         if (int vk = PollBindKey(presses))
         {
-            FGUI::JoinHotkeyVK = vk;
+            if (IsReservedOverlayKey(vk, 1) || IsSavedActionHotkey(vk))
+                SetBindError("That key is already assigned to another ATLAS action.");
+            else
+            {
+                FGUI::JoinHotkeyVK = vk;
+                FGUI::SaveJoinHotkey();
+            }
             FGUI::bRebindingJoin = false;
             FGUI::RebindingMacroIndex = -2;
-            FGUI::SaveJoinHotkey();
             EndBindCapture();
         }
         return;
@@ -1035,7 +1704,11 @@ void GUI_HandleInput(bool windowActive)
     {
         if (int vk = PollBindKey(presses))
         {
-            if (FGUI::RebindingCommandIndex == -1)
+            if (IsReservedOverlayKey(vk, -1))
+            {
+                SetBindError("Menu, Join, and Unreal console keys are reserved.");
+            }
+            else if (FGUI::RebindingCommandIndex == -1)
             {
                 FGUI::PendingCommandVK = vk;
             }
@@ -1055,7 +1728,11 @@ void GUI_HandleInput(bool windowActive)
     {
         if (int vk = PollBindKey(presses))
         {
-            if (FGUI::RebindingMacroIndex >= 0 && FGUI::RebindingMacroIndex < (int)FGUI::Macros.size())
+            if (IsReservedOverlayKey(vk, -1))
+            {
+                SetBindError("Menu, Join, and Unreal console keys are reserved.");
+            }
+            else if (FGUI::RebindingMacroIndex >= 0 && FGUI::RebindingMacroIndex < (int)FGUI::Macros.size())
             {
                 FGUI::Macros[FGUI::RebindingMacroIndex].VK = vk;
                 FGUI::SaveMacros();
@@ -1067,16 +1744,74 @@ void GUI_HandleInput(bool windowActive)
         return;
     }
 
-    const unsigned int hotkeyPresses = TakePressCount(presses, FGUI::HotkeyVK);
-    if ((hotkeyPresses & 1u) != 0)
-        FGUI::bVisible = !FGUI::bVisible;
+    const unsigned int menuHotkeyPresses = TakePressCount(presses, FGUI::HotkeyVK);
+    if ((menuHotkeyPresses & 1u) != 0)
+    {
+        if (FGUI::bVisible.load(std::memory_order_acquire))
+        {
+            CloseMenuSurface();
+        }
+        else
+        {
+            FGUI::bVisible.store(true, std::memory_order_release);
+            g_FocusMenuWindow = true;
+        }
+    }
 
-    if (TakePressCount(presses, FGUI::JoinHotkeyVK) > 0)
+    const unsigned int consoleHotkeyPresses =
+        TakePressCount(presses, VK_OEM_3) +
+        TakePressCount(presses, VK_F8);
+    if (IsAtlasConsoleSelected())
+    {
+        const unsigned int advances = consoleHotkeyPresses % 3u;
+        for (unsigned int advance = 0; advance < advances; advance++)
+        {
+            if (!FGUI::bConsoleVisible.load(std::memory_order_acquire))
+            {
+                g_ConsoleUi.Expanded = false;
+                g_ConsoleUi.ResetExpansion = true;
+                FGUI::bConsoleVisible.store(true, std::memory_order_release);
+                RefreshInitialHelpSession(true);
+            }
+            else if (!g_ConsoleUi.Expanded)
+            {
+                g_ConsoleUi.Expanded = true;
+            }
+            else
+            {
+                CloseConsoleSurface();
+            }
+
+            g_ConsoleUi.FocusInput = true;
+            g_ConsoleUi.ScrollToBottom = true;
+        }
+    }
+
+    if (FGUI::bConsoleVisible.load(std::memory_order_acquire) &&
+        (!FGUI::bVisible.load(std::memory_order_acquire) ||
+            g_ConsoleUi.WindowFocused || !g_MenuWindowFocused))
+    {
+        unsigned int escapePresses =
+            TakePressCount(presses, VK_ESCAPE);
+        if (escapePresses > 0 &&
+            DismissConsoleHistory())
+        {
+            escapePresses--;
+        }
+
+        if (escapePresses > 0)
+            CloseConsoleSurface();
+    }
+
+    if (!wasOverlayVisible && !GUI_IsOverlayVisible() &&
+        TakePressCount(presses, FGUI::JoinHotkeyVK) > 0)
+    {
         JoinSelectedHost();
+    }
 
     // Do not execute presses made while the overlay was visible, including
     // other keys received in the same batch as the close hotkey.
-    if (!wasVisible && !FGUI::bVisible)
+    if (!wasOverlayVisible && !GUI_IsOverlayVisible())
     {
         for (const auto& command : FGUI::Commands)
         {
@@ -1094,34 +1829,715 @@ void GUI_HandleInput(bool windowActive)
     }
 }
 
+static std::string TrimCommand(const std::string& value)
+{
+    size_t start = 0;
+    while (start < value.size() && std::isspace(static_cast<unsigned char>(value[start])))
+        start++;
+
+    size_t end = value.size();
+    while (end > start && std::isspace(static_cast<unsigned char>(value[end - 1])))
+        end--;
+
+    return value.substr(start, end - start);
+}
+
+static std::string NormalizeConsoleCommand(const std::string& entered)
+{
+    if (entered.empty() || entered[0] != '/')
+        return TrimCommand(entered);
+
+    std::string shorthand = TrimCommand(entered.substr(1));
+    if (shorthand.empty())
+        return std::string();
+
+    if (StartsWithInsensitive(shorthand, "cheat") &&
+        (shorthand.size() == 5 || std::isspace(static_cast<unsigned char>(shorthand[5]))))
+        return shorthand;
+
+    return "cheat " + shorthand;
+}
+
+static std::string LowercaseKey(const std::string& value)
+{
+    std::string lowered = value;
+    for (char& ch : lowered)
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    return lowered;
+}
+
+static std::string ToConsoleCandidate(const std::string& command)
+{
+    const std::string trimmed = TrimCommand(command);
+    if (!StartsWithInsensitive(trimmed, "cheat"))
+        return trimmed;
+
+    size_t position = 5;
+    if (position < trimmed.size() && !std::isspace(static_cast<unsigned char>(trimmed[position])))
+        return trimmed;
+    while (position < trimmed.size() && std::isspace(static_cast<unsigned char>(trimmed[position])))
+        position++;
+
+    return "/" + trimmed.substr(position);
+}
+
+static void AddCompletionCandidate(std::vector<std::string>& candidates,
+    std::unordered_set<std::string>& seen, const std::string& candidate, const std::string& prefix)
+{
+    size_t start = 0;
+    while (start < candidate.size() &&
+        std::isspace(static_cast<unsigned char>(candidate[start])))
+    {
+        start++;
+    }
+
+    const std::string completion = candidate.substr(start);
+    if (TrimCommand(completion).empty() || !StartsWithInsensitive(completion, prefix))
+        return;
+
+    const std::string key = LowercaseKey(completion);
+    if (seen.insert(key).second)
+        candidates.push_back(completion);
+}
+
+static std::vector<std::string> BuildCompletionCandidates(const std::string& prefix)
+{
+    std::vector<std::string> candidates;
+    std::unordered_set<std::string> seen;
+
+    for (auto it = g_ConsoleUi.History.rbegin(); it != g_ConsoleUi.History.rend(); ++it)
+        AddCompletionCandidate(candidates, seen, *it, prefix);
+
+    for (const auto& command : FGUI::Commands)
+        AddCompletionCandidate(candidates, seen, ToConsoleCandidate(command.Command), prefix);
+
+    for (const auto& macro : FGUI::Macros)
+        for (const auto& step : macro.Steps)
+            AddCompletionCandidate(candidates, seen, ToConsoleCandidate(step.Command), prefix);
+
+    static const char* kCommonCommands[] = {
+        "/give ", "/suicide", "/startaircraft", "/outputge", "/applyge ",
+        "/dumpge", "/god", "/fly", "fov ", "open "
+    };
+    for (const char* command : kCommonCommands)
+        AddCompletionCandidate(candidates, seen, command, prefix);
+
+    return candidates;
+}
+
+static void ReplaceConsoleInput(ImGuiInputTextCallbackData* data, const std::string& value)
+{
+    data->DeleteChars(0, data->BufTextLen);
+    data->InsertChars(0, value.c_str());
+    data->CursorPos = data->SelectionStart = data->SelectionEnd = data->BufTextLen;
+}
+
+static int ConsoleInputCallback(ImGuiInputTextCallbackData* data)
+{
+    auto& state = *static_cast<FConsoleUiState*>(data->UserData);
+
+    if (data->EventFlag == ImGuiInputTextFlags_CallbackHistory)
+    {
+        state.CompletionMatches.clear();
+        state.CompletionPosition = -1;
+
+        if (data->EventKey == ImGuiKey_UpArrow)
+        {
+            if (state.History.empty())
+                return 0;
+
+            if (state.HistoryPosition < 0)
+            {
+                state.Draft.assign(data->Buf, static_cast<size_t>(data->BufTextLen));
+                state.HistoryPosition = static_cast<int>(state.History.size()) - 1;
+            }
+            else
+            {
+                const int historyCount =
+                    static_cast<int>(state.History.size());
+                state.HistoryPosition =
+                    (state.HistoryPosition - 1 + historyCount) %
+                    historyCount;
+            }
+
+            ReplaceConsoleInput(data, state.History[static_cast<size_t>(state.HistoryPosition)]);
+        }
+        else if (data->EventKey == ImGuiKey_DownArrow &&
+            state.HistoryPosition >= 0 &&
+            !state.History.empty())
+        {
+            state.HistoryPosition =
+                (state.HistoryPosition + 1) %
+                static_cast<int>(state.History.size());
+            ReplaceConsoleInput(
+                data,
+                state.History[
+                    static_cast<size_t>(
+                        state.HistoryPosition)]);
+        }
+    }
+    else if (data->EventFlag == ImGuiInputTextFlags_CallbackCompletion)
+    {
+        state.HistoryPosition = -1;
+        state.Draft.clear();
+        const std::string current(data->Buf, static_cast<size_t>(data->BufTextLen));
+        if (!state.CompletionMatches.empty() && state.CompletionPosition >= 0 &&
+            current == state.CompletionMatches[static_cast<size_t>(state.CompletionPosition)])
+        {
+            state.CompletionPosition =
+                (state.CompletionPosition + 1) % static_cast<int>(state.CompletionMatches.size());
+        }
+        else
+        {
+            state.CompletionSeed = current;
+            state.CompletionMatches = BuildCompletionCandidates(current);
+            state.CompletionPosition = state.CompletionMatches.empty() ? -1 : 0;
+        }
+
+        if (state.CompletionPosition >= 0)
+            ReplaceConsoleInput(data, state.CompletionMatches[static_cast<size_t>(state.CompletionPosition)]);
+    }
+    else if (data->EventFlag == ImGuiInputTextFlags_CallbackEdit)
+    {
+        if (data->BufTextLen > static_cast<int>(kMaximumConsoleCommandLength))
+        {
+            int validLength = static_cast<int>(kMaximumConsoleCommandLength);
+            while (validLength > 0 &&
+                (static_cast<unsigned char>(data->Buf[validLength]) & 0xC0) == 0x80)
+            {
+                validLength--;
+            }
+            data->DeleteChars(validLength, data->BufTextLen - validLength);
+        }
+
+        state.HistoryPosition = -1;
+        state.Draft.clear();
+        state.CompletionMatches.clear();
+        state.CompletionPosition = -1;
+    }
+
+    return 0;
+}
+
+static void RememberConsoleCommand(const std::string& command)
+{
+    const std::string key = LowercaseKey(command);
+    for (auto it = g_ConsoleUi.History.begin(); it != g_ConsoleUi.History.end();)
+    {
+        if (LowercaseKey(*it) == key)
+            it = g_ConsoleUi.History.erase(it);
+        else
+            ++it;
+    }
+
+    g_ConsoleUi.History.push_back(command);
+    if (g_ConsoleUi.History.size() > kMaximumConsoleHistory)
+        g_ConsoleUi.History.erase(g_ConsoleUi.History.begin());
+}
+
+static bool SubmitConsoleCommand()
+{
+    const std::string raw = g_ConsoleUi.Input;
+    const std::string entered = TrimCommand(raw);
+    if (entered.empty())
+        return false;
+
+    if (raw.size() > kMaximumConsoleCommandLength)
+    {
+        AppendConsoleLine(EConsoleLineKind::Error, "[ATLAS] Command is too long (maximum 2048 bytes).");
+        g_ConsoleUi.FocusInput = true;
+        return false;
+    }
+
+    const std::string command = NormalizeConsoleCommand(raw);
+    if (command.empty())
+    {
+        AppendConsoleLine(EConsoleLineKind::Error, "[ATLAS] Enter a command after '/'.");
+        g_ConsoleUi.FocusInput = true;
+        return false;
+    }
+
+    if (!Exec(command.c_str()))
+    {
+        AppendConsoleLine(
+            EConsoleLineKind::Error,
+            g_GameThreadDispatcherReady.load(
+                std::memory_order_acquire)
+                ? "[ATLAS] Command queue is full; command was not sent."
+                : "[ATLAS] Unreal game-thread command dispatcher is unavailable.");
+        g_ConsoleUi.FocusInput = true;
+        return false;
+    }
+
+    RememberConsoleCommand(raw);
+    std::string echo = "> " + raw;
+    AppendConsoleLine(EConsoleLineKind::Command, std::move(echo));
+
+    g_ConsoleUi.Input.clear();
+    g_ConsoleUi.Draft.clear();
+    g_ConsoleUi.HistoryPosition = -1;
+    g_ConsoleUi.CompletionMatches.clear();
+    g_ConsoleUi.CompletionPosition = -1;
+    g_ConsoleUi.FocusInput = true;
+    g_ConsoleUi.ScrollToBottom = true;
+    return true;
+}
+
+static ImVec4 ConsoleLineColor(EConsoleLineKind kind)
+{
+    switch (kind)
+    {
+    case EConsoleLineKind::Command: return ImVec4(1.f, 1.f, 1.f, 1.f);
+    case EConsoleLineKind::System:  return ImVec4(0.70f, 0.70f, 0.72f, 1.f);
+    case EConsoleLineKind::Error:   return ImVec4(1.f, 0.39f, 0.43f, 1.f);
+    default:                        return Accent();
+    }
+}
+
+static void DrawConsoleHistoryPopup(
+    const ImVec2& inputMin, const ImVec2& inputMax)
+{
+    const int selected = g_ConsoleUi.HistoryPosition;
+    const int historyCount =
+        static_cast<int>(g_ConsoleUi.History.size());
+    if (selected < 0 || selected >= historyCount)
+        return;
+
+    static constexpr int kMaximumVisibleHistory = 5;
+    const int visibleCount =
+        (std::min)(kMaximumVisibleHistory, historyCount);
+    const int maximumFirst =
+        historyCount - visibleCount;
+    const int first =
+        (std::max)(
+            0,
+            (std::min)(
+                maximumFirst,
+                selected - visibleCount / 2));
+    const int last = first + visibleCount - 1;
+    const float rowHeight =
+        std::ceil(ImGui::GetTextLineHeight() + 5.f);
+    const float popupPadding = 3.f;
+    float popupWidth = 96.f;
+    for (int index = first; index <= last; index++)
+    {
+        const std::string label =
+            "> " + g_ConsoleUi.History[static_cast<size_t>(index)];
+        popupWidth =
+            (std::max)(
+                popupWidth,
+                ImGui::CalcTextSize(label.c_str()).x + 14.f);
+    }
+    popupWidth =
+        std::ceil(
+            (std::min)(
+                popupWidth,
+                inputMax.x - inputMin.x));
+
+    const float popupHeight =
+        rowHeight * static_cast<float>(visibleCount) +
+        popupPadding * 2.f;
+    const ImVec2 popupMax(
+        std::round(inputMin.x) + popupWidth,
+        std::round(inputMin.y - 2.f));
+    const ImVec2 popupMin(
+        std::round(inputMin.x),
+        popupMax.y - popupHeight);
+
+    ImDrawList* draw = ImGui::GetForegroundDrawList();
+    draw->AddRectFilled(
+        popupMin,
+        popupMax,
+        ImGui::GetColorU32(
+            ImVec4(0.025f, 0.025f, 0.025f, 0.94f)));
+    draw->PushClipRect(popupMin, popupMax, true);
+    for (int index = first; index <= last; index++)
+    {
+        const float rowTop =
+            popupMin.y + popupPadding +
+            rowHeight * static_cast<float>(index - first);
+        if (index == selected)
+        {
+            draw->AddRectFilled(
+                ImVec2(popupMin.x + 2.f, rowTop),
+                ImVec2(popupMax.x - 2.f, rowTop + rowHeight),
+                ImGui::GetColorU32(
+                    ImVec4(0.24f, 0.24f, 0.24f, 0.72f)));
+        }
+
+        const std::string label =
+            "> " + g_ConsoleUi.History[static_cast<size_t>(index)];
+        draw->AddText(
+            ImVec2(popupMin.x + 7.f, rowTop + 2.f),
+            ImGui::GetColorU32(
+                index == selected
+                    ? ImVec4(1.f, 1.f, 1.f, 1.f)
+                    : ImVec4(0.68f, 0.68f, 0.70f, 1.f)),
+            label.c_str());
+    }
+    draw->PopClipRect();
+}
+
+static bool RenderConsoleCommandInput(
+    float rightPadding, float frameOpacity)
+{
+    ImGui::SetNextItemWidth((std::max)(
+        120.f, ImGui::GetContentRegionAvail().x - rightPadding));
+    if (g_ConsoleUi.FocusInput &&
+        FGUI::bConsoleVisible.load(std::memory_order_acquire))
+    {
+        ImGui::SetKeyboardFocusHere();
+        g_ConsoleUi.FocusInput = false;
+    }
+
+    const ImGuiInputTextFlags inputFlags =
+        ImGuiInputTextFlags_EnterReturnsTrue |
+        ImGuiInputTextFlags_CallbackHistory |
+        ImGuiInputTextFlags_CallbackCompletion |
+        ImGuiInputTextFlags_CallbackEdit;
+
+    const ImVec2 promptSize = ImGui::CalcTextSize(">");
+    const float promptLeftPadding = 8.f;
+    const float promptGap = 7.f;
+    const float frameAlpha =
+        (std::max)(0.f, (std::min)(1.f, frameOpacity));
+    const ImVec2 framePadding = ImGui::GetStyle().FramePadding;
+    ImGui::PushStyleVar(
+        ImGuiStyleVar_FramePadding,
+        ImVec2(
+            promptLeftPadding + promptSize.x + promptGap,
+            framePadding.y));
+    ImGui::PushStyleVar(
+        ImGuiStyleVar_FrameBorderSize, 0.f);
+    ImGui::PushStyleColor(
+        ImGuiCol_Text, ImVec4(1.f, 1.f, 1.f, 1.f));
+    ImGui::PushStyleColor(
+        ImGuiCol_TextSelectedBg,
+        ImVec4(0.42f, 0.42f, 0.42f, 0.55f));
+    ImGui::PushStyleColor(
+        ImGuiCol_NavHighlight,
+        ImVec4(0.58f, 0.58f, 0.60f, 0.72f));
+    ImGui::PushStyleColor(
+        ImGuiCol_FrameBg, ImVec4(0.f, 0.f, 0.f, frameAlpha));
+    ImGui::PushStyleColor(
+        ImGuiCol_FrameBgHovered, ImVec4(0.f, 0.f, 0.f, frameAlpha));
+    ImGui::PushStyleColor(
+        ImGuiCol_FrameBgActive, ImVec4(0.f, 0.f, 0.f, frameAlpha));
+    const bool submitted = ImGui::InputText(
+        "##console_input", &g_ConsoleUi.Input,
+        inputFlags, ConsoleInputCallback, &g_ConsoleUi);
+    const ImVec2 inputMin = ImGui::GetItemRectMin();
+    const ImVec2 inputMax = ImGui::GetItemRectMax();
+    ImGui::PopStyleColor(6);
+    ImGui::PopStyleVar(2);
+
+    const float promptY =
+        std::round(
+            inputMin.y +
+            (std::max)(
+                0.f,
+                (inputMax.y - inputMin.y - promptSize.y) * 0.5f));
+    ImGui::GetWindowDrawList()->AddText(
+        ImVec2(
+            std::round(inputMin.x + promptLeftPadding),
+            promptY),
+        ImGui::GetColorU32(
+            ImVec4(1.f, 1.f, 1.f, 1.f)),
+        ">");
+    DrawConsoleHistoryPopup(inputMin, inputMax);
+
+    return submitted && SubmitConsoleCommand();
+}
+
+static void RenderConsoleWindow(float fade)
+{
+    if (fade <= 0.f)
+        return;
+
+    ImGuiIO& io = ImGui::GetIO();
+    const bool expanded = g_ConsoleUi.Expanded;
+    const float consoleWidth = (std::max)(1.f, io.DisplaySize.x);
+    const float screenBottom =
+        std::round((std::max)(1.f, io.DisplaySize.y));
+    const float compactHeight =
+        (std::min)(screenBottom, 40.f);
+    const float expansion =
+        g_ConsoleUi.Expansion * g_ConsoleUi.Expansion *
+        (3.f - 2.f * g_ConsoleUi.Expansion);
+    const float desiredConsoleHeight =
+        compactHeight +
+        (screenBottom - compactHeight) *
+            expansion;
+    const float consoleY =
+        std::round(
+            (std::max)(
+                0.f,
+                screenBottom - desiredConsoleHeight));
+    const float consoleHeight =
+        (std::max)(1.f, screenBottom - consoleY);
+    const bool showExpandedContent =
+        expanded && consoleHeight >= 220.f;
+
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoScrollbar |
+        ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoResize;
+    if (!FGUI::bConsoleVisible)
+        flags |= ImGuiWindowFlags_NoInputs;
+
+    ImGui::SetNextWindowPos(ImVec2(0.f, consoleY), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(
+        ImVec2(consoleWidth, consoleHeight), ImGuiCond_Always);
+    if (g_ConsoleUi.FocusInput && FGUI::bConsoleVisible)
+        ImGui::SetNextWindowFocus();
+
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, fade);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f, 0.f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.f);
+    // The expanded console is a dimmed game view with output drawn directly
+    // over it. Keep this interaction window invisible; only the command input
+    // retains its own black frame.
+    ImGui::PushStyleColor(
+        ImGuiCol_WindowBg,
+        ImVec4(0.f, 0.f, 0.f, 0.f));
+    ImGui::Begin("##atlas_unreal_console", nullptr, flags);
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar(3);
+    g_ConsoleUi.WindowFocused =
+        FGUI::bConsoleVisible.load(std::memory_order_acquire) &&
+        ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+
+    const float width = ImGui::GetWindowWidth();
+    const ImVec2 windowPos = ImGui::GetWindowPos();
+    const float horizontalPadding = 8.f;
+    const float inputScreenY =
+        screenBottom -
+        std::round(ImGui::GetFrameHeight()) - 7.f;
+    const float inputY =
+        (std::max)(
+            2.f,
+            inputScreenY - windowPos.y);
+    const float inputFrameOpacity =
+        0.90f + 0.10f * g_ConsoleUi.Expansion;
+
+    if (!showExpandedContent)
+    {
+        ImGui::SetCursorPos(ImVec2(horizontalPadding, inputY));
+        if (RenderConsoleCommandInput(
+                horizontalPadding, inputFrameOpacity) &&
+            !expanded)
+            CloseConsoleSurface();
+    }
+    else
+    {
+        ImGui::SetCursorPos(ImVec2(horizontalPadding, 7.f));
+        const float logHeight = (std::max)(
+            80.f,
+            inputY - ImGui::GetCursorPosY() - 4.f);
+        ImGui::PushStyleColor(
+            ImGuiCol_ChildBg,
+            ImVec4(0.f, 0.f, 0.f, 0.f));
+        ImGui::PushStyleColor(
+            ImGuiCol_ScrollbarBg,
+            ImVec4(0.035f, 0.035f, 0.035f, 0.58f));
+        ImGui::PushStyleColor(
+            ImGuiCol_ScrollbarGrab,
+            ImVec4(0.38f, 0.38f, 0.40f, 0.88f));
+        ImGui::PushStyleColor(
+            ImGuiCol_ScrollbarGrabHovered,
+            ImVec4(0.52f, 0.52f, 0.54f, 0.96f));
+        ImGui::PushStyleColor(
+            ImGuiCol_ScrollbarGrabActive,
+            ImVec4(0.66f, 0.66f, 0.68f, 1.f));
+        ImGui::PushStyleVar(
+            ImGuiStyleVar_ChildBorderSize, 0.f);
+        ImGui::PushStyleVar(
+            ImGuiStyleVar_ChildRounding, 0.f);
+        ImGui::PushStyleVar(
+            ImGuiStyleVar_ScrollbarSize, 11.f);
+        ImGui::PushStyleVar(
+            ImGuiStyleVar_ScrollbarRounding, 1.f);
+        ImGui::BeginChild(
+            "##console_log",
+            ImVec2(width - horizontalPadding * 2.f, logHeight),
+            false,
+            ImGuiWindowFlags_HorizontalScrollbar);
+
+        static uint64_t lastRenderedRevision = 0;
+        const bool hasNewLines =
+            lastRenderedRevision != g_ConsoleLineRevision;
+        const bool shouldScroll =
+            g_ConsoleUi.ScrollToBottom ||
+            (hasNewLines && g_ConsoleUi.WasAtBottom);
+        const bool wasAtBottom =
+            ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 2.f;
+
+        if (!g_ConsoleLines.empty())
+        {
+            const float lineHeight =
+                ImGui::GetTextLineHeightWithSpacing();
+            const float lineContentHeight =
+                lineHeight *
+                static_cast<float>(g_ConsoleLines.size());
+            const float bottomAlignment =
+                (std::max)(
+                    0.f,
+                    ImGui::GetContentRegionAvail().y -
+                        lineContentHeight);
+            if (bottomAlignment > 0.f)
+            {
+                ImGui::SetCursorPosY(
+                    ImGui::GetCursorPosY() +
+                    bottomAlignment);
+            }
+
+            ImGuiListClipper clipper;
+            clipper.Begin(
+                static_cast<int>(g_ConsoleLines.size()),
+                lineHeight);
+            if (shouldScroll)
+            {
+                clipper.IncludeItemByIndex(
+                    static_cast<int>(g_ConsoleLines.size()) - 1);
+            }
+
+            while (clipper.Step())
+            {
+                for (int row = clipper.DisplayStart;
+                    row < clipper.DisplayEnd; row++)
+                {
+                    const FConsoleLine& line =
+                        g_ConsoleLines[static_cast<size_t>(row)];
+                    ImGui::PushID(static_cast<int>(line.Id));
+                    ImGui::PushStyleColor(
+                        ImGuiCol_Text,
+                        ImVec4(0.46f, 0.46f, 0.48f, 1.f));
+                    ImGui::TextUnformatted(line.Time.c_str());
+                    ImGui::PopStyleColor();
+                    ImGui::SameLine();
+                    ImGui::PushStyleColor(
+                        ImGuiCol_Text,
+                        ConsoleLineColor(line.Kind));
+                    ImGui::TextUnformatted(line.Text.c_str());
+                    ImGui::PopStyleColor();
+                    ImGui::PopID();
+
+                    if (shouldScroll &&
+                        row == static_cast<int>(
+                            g_ConsoleLines.size()) - 1)
+                    {
+                        ImGui::SetScrollHereY(1.f);
+                    }
+                }
+            }
+        }
+
+        g_ConsoleUi.WasAtBottom = shouldScroll || wasAtBottom;
+        g_ConsoleUi.ScrollToBottom = false;
+        lastRenderedRevision = g_ConsoleLineRevision;
+        ImGui::EndChild();
+        ImGui::PopStyleVar(4);
+        ImGui::PopStyleColor(5);
+
+        ImGui::SetCursorPos(ImVec2(horizontalPadding, inputY));
+        (void)RenderConsoleCommandInput(
+            horizontalPadding, inputFrameOpacity);
+    }
+
+    ImGui::End();
+    ImGui::PopStyleVar();
+}
+
 void GUI_Render()
 {
     ImGuiIO& io = ImGui::GetIO();
+    DrainConsoleOutput();
 
-    static float s_Fade = 0.f;
-    const float target = FGUI::bVisible ? 1.f : 0.f;
-    const float fadeStep = (io.DeltaTime > 0.f ? io.DeltaTime : 1.f / 60.f) / 0.15f;
-    if (s_Fade < target) { s_Fade += fadeStep; if (s_Fade > target) s_Fade = target; }
-    else if (s_Fade > target) { s_Fade -= fadeStep; if (s_Fade < target) s_Fade = target; }
+    static float s_MenuFade = 0.f;
+    static float s_ConsoleFade = 0.f;
+    const float deltaTime = io.DeltaTime > 0.f ? io.DeltaTime : 1.f / 60.f;
 
-    if (s_Fade <= 0.f)
+    if (g_ConsoleUi.ResetExpansion)
+    {
+        g_ConsoleUi.Expansion = 0.f;
+        g_ConsoleUi.ResetExpansion = false;
+    }
+    const float expansionTarget =
+        g_ConsoleUi.Expanded ? 1.f : 0.f;
+    const float expansionStep = deltaTime / 0.16f;
+    if (g_ConsoleUi.Expansion < expansionTarget)
+    {
+        g_ConsoleUi.Expansion =
+            (std::min)(expansionTarget,
+                g_ConsoleUi.Expansion + expansionStep);
+    }
+    else if (g_ConsoleUi.Expansion > expansionTarget)
+    {
+        g_ConsoleUi.Expansion =
+            (std::max)(expansionTarget,
+                g_ConsoleUi.Expansion - expansionStep);
+    }
+
+    auto updateFade = [deltaTime](float& value, bool visible, float duration)
+    {
+        const float target = visible ? 1.f : 0.f;
+        const float step = deltaTime / duration;
+        if (value < target) { value += step; if (value > target) value = target; }
+        else if (value > target) { value -= step; if (value < target) value = target; }
+    };
+
+    updateFade(s_MenuFade, FGUI::bVisible, 0.15f);
+    updateFade(s_ConsoleFade, FGUI::bConsoleVisible, 0.18f);
+
+    const float menuFade = s_MenuFade * s_MenuFade * (3.f - 2.f * s_MenuFade);
+    const float consoleFade = s_ConsoleFade * s_ConsoleFade * (3.f - 2.f * s_ConsoleFade);
+    const float surfaceFade = (std::max)(menuFade, consoleFade);
+
+    if (surfaceFade <= 0.f)
         return;
 
-    const float fade = s_Fade * s_Fade * (3.f - 2.f * s_Fade);
+    const float backdropOpacity = (std::max)(
+        menuFade * 0.50f,
+        consoleFade *
+            (0.50f * g_ConsoleUi.Expansion));
+    if (backdropOpacity > 0.f)
+    {
+        ImGui::GetBackgroundDrawList()->AddRectFilled(
+            ImVec2(0.f, 0.f),
+            io.DisplaySize,
+            IM_COL32(
+                0, 0, 0,
+                static_cast<int>(backdropOpacity * 255.f)));
+    }
 
-    ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0.f, 0.f), io.DisplaySize, IM_COL32(0, 0, 0, (int)(fade * 0.50f * 255.f)));
+    RenderConsoleWindow(consoleFade);
+    if (menuFade <= 0.f)
+        return;
 
-    ImGuiWindowFlags wflags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoTitleBar;
+    const float fade = menuFade;
+    ImGuiWindowFlags wflags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoTitleBar;
+    if (!FGUI::bVisible)
+        wflags |= ImGuiWindowFlags_NoInputs;
 
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Once, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(580.f, 410.f), ImGuiCond_Once);
     ImGui::SetNextWindowSizeConstraints(ImVec2(500.f, 320.f), ImVec2(10000.f, 10000.f));
+    if (g_FocusMenuWindow && FGUI::bVisible)
+    {
+        ImGui::SetNextWindowFocus();
+        g_FocusMenuWindow = false;
+    }
 
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, fade);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f, 0.f));
     bool open = true;
     ImGui::Begin("##atlas_main", &open, wflags);
     ImGui::PopStyleVar();
+    g_MenuWindowFocused =
+        FGUI::bVisible.load(std::memory_order_acquire) &&
+        ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
 
     const float W = ImGui::GetWindowWidth();
     const float H = ImGui::GetWindowHeight();
@@ -1155,7 +2571,7 @@ void GUI_Render()
         ImGui::SameLine(0.f, 6.f);
         ImGui::SetCursorPosY(TitleY);
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.353f, 0.388f, 0.478f, 1.f));
-        ImGui::Text("| Console");
+        ImGui::Text("| Client");
         ImGui::PopStyleColor();
 
         ImGui::SameLine(0.f, 8.f);
@@ -1180,7 +2596,7 @@ void GUI_Render()
 
         ImGui::SetCursorPos(ImVec2(CloseX, (TopBarH - CloseSize) * 0.5f));
         if (ImGui::InvisibleButton("##closebtn", ImVec2(CloseSize, CloseSize)))
-            FGUI::bVisible = false;
+            CloseMenuSurface();
         {
             const bool hovered = ImGui::IsItemHovered();
             ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -1197,7 +2613,7 @@ void GUI_Render()
 
 	// divider lines
     {
-        ImDrawList* fdl = ImGui::GetForegroundDrawList();
+        ImDrawList* fdl = ImGui::GetWindowDrawList();
         const ImU32 line = IM_COL32(35, 42, 62, (int)(fade * 255.f));
         fdl->AddLine(ImVec2(wp.x, wp.y + TopBarH), ImVec2(wp.x + W, wp.y + TopBarH), line, 1.f);
         fdl->AddLine(ImVec2(wp.x + SidebarW, wp.y + TopBarH), ImVec2(wp.x + SidebarW, wp.y + H), line, 1.f);
@@ -1344,15 +2760,6 @@ void GUI_Render()
 
     SectionLabel("Respawn");
     ImGui::Checkbox("Respawns Enabled", &FConfiguration::bForceRespawns);
-
-    SectionLabel("Console");
-    if (ImGui::Checkbox("Console Enabled", &FConfiguration::bConsoleEnabled))
-    {
-        if (FConfiguration::bConsoleEnabled)
-            SpawnConsole();
-        else
-            DestroyConsole();
-    }
 
         break;
     }
@@ -1643,6 +3050,26 @@ void GUI_Render()
     }
     case 2: // Config
     {
+    SectionLabel("Console Style");
+    int consoleMode =
+        FConfiguration::ConsoleMode.load(std::memory_order_acquire);
+    ImGui::SetNextItemWidth(CW);
+    if (ImGui::Combo("##console_mode", &consoleMode,
+        "ATLAS Console\0Original UE Console\0"))
+    {
+        consoleMode = HotkeyPersist::SanitizeConsoleMode(consoleMode);
+        FConfiguration::ConsoleMode.store(
+            consoleMode, std::memory_order_release);
+        HotkeyPersist::SaveConsoleMode(consoleMode);
+        AtlasDiagnostics::WriteLine("console-mode changed=%s",
+            consoleMode == static_cast<int>(EConsoleMode::Unreal)
+                ? "original-unreal"
+                : "atlas");
+
+        if (consoleMode == static_cast<int>(EConsoleMode::Unreal))
+            CloseConsoleSurface();
+    }
+    SectionLabel("Hotkeys");
     if (FGUI::bRebinding)
     {
         ImGui::PushStyleColor(ImGuiCol_Text, Accent());
@@ -1653,7 +3080,7 @@ void GUI_Render()
     else
     {
         char btnLabel[64];
-        snprintf(btnLabel, sizeof(btnLabel), "Rebind GUI Key    [%s]", VKName(FGUI::HotkeyVK));
+        snprintf(btnLabel, sizeof(btnLabel), "Rebind Menu Key      [%s]", VKName(FGUI::HotkeyVK));
         if (ImGui::Button(btnLabel, ImVec2(CW, 0.f)))
         {
             FGUI::bRebinding = true;
@@ -1685,15 +3112,23 @@ void GUI_Render()
         }
     }
 
+    if (!g_BindError.empty() && GetTickCount64() < g_BindErrorUntil)
+    {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.f, 0.39f, 0.43f, 1.f));
+        ImGui::TextWrapped("%s", g_BindError.c_str());
+        ImGui::PopStyleColor();
+    }
+
     if (ImGui::Button("Reset All", ImVec2(CW, 0.f)))
     {
         EndBindCapture();
         FGUI::ResetAll();
+        CloseConsoleSurface();
     }
 
     ImGui::Spacing();
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.353f, 0.388f, 0.478f, 1.f));
-    ImGui::TextWrapped("Hotkeys, command binds, and macros are saved automatically. Reset All restores default hotkeys and deletes saved commands and macros.");
+    ImGui::TextWrapped("Console mode, hotkeys, command binds, and macros are saved automatically. Reset All restores the ATLAS console, F9 menu, F5 Join, and deletes saved commands and macros.");
     ImGui::PopStyleColor();
 
         ImGui::Dummy(ImVec2(0.f, 8.f));
@@ -1707,4 +3142,7 @@ void GUI_Render()
     ImGui::End();
 
     ImGui::PopStyleVar();
+
+    if (!open)
+        CloseMenuSurface();
 }

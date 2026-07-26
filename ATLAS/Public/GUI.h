@@ -5,23 +5,29 @@
 #include "../Public/Hotkey.h"
 #include "../ImGui/imgui.h"
 #include <d3d12.h>
+#include <atomic>
 #include <string>
 #include <vector>
 
 void GUI_Init();
 void GUI_Render();
 void GUI_HandleInput(bool windowActive);
+void GUI_SetGameThreadDispatcherReady(bool ready);
+void GUI_PumpGameThreadCommands();
 void GUI_QueueInputMessage(UINT message, WPARAM wParam, LPARAM lParam);
 bool GUI_ShouldConsumeInputMessage(UINT message, WPARAM wParam);
-bool GUI_ShouldConsumeRawInput(LPARAM lParam);
+bool GUI_IsOwnedHotkey(int vk);
+bool GUI_IsOverlayVisible();
+bool GUI_QueueConsoleOutput(const wchar_t* text, int length);
 void GUI_LoadTextures(ID3D11Device* device);
 void GUI_LoadTexturesDX12(ID3D12Device* device, ID3D12CommandQueue* commandQueue, D3D12_CPU_DESCRIPTOR_HANDLE srvCpu, D3D12_GPU_DESCRIPTOR_HANDLE srvGpu);
 
 struct FGUI
 {
-    static inline bool bVisible = false;
+    static inline std::atomic_bool bVisible = false;
+    static inline std::atomic_bool bConsoleVisible = false;
 
-    static inline int HotkeyVK = VK_F9;
+    static inline std::atomic_int HotkeyVK = VK_F9;
     static inline bool bRebinding = false;
 
     static inline int ActiveTab = 0; // selected sidebar tab
@@ -34,7 +40,7 @@ struct FGUI
     static inline int HostType = 0; // 0 = Local Host, 1 = Remote Host
     static inline char RemoteIP[64] = "";
 
-    static inline int JoinHotkeyVK = VK_F5;
+    static inline std::atomic_int JoinHotkeyVK = VK_F5;
     static inline bool bRebindingJoin = false;
 
     static inline std::vector<HotkeyPersist::CommandBind> Commands;

@@ -22,7 +22,7 @@ ATLAS Console is a lightweight in-game overlay and client mod for OGFN private s
 
 - Toggle the overlay in-game with a configurable hotkey (default: F9).
 
-- Hotkey is saved automatically and persists across sessions via `%APPDATA%\\ATLAS\\settings.json`.
+- The menu and Join hotkeys, plus the selected console mode, are saved automatically in `%APPDATA%\\ATLAS\\console.json`.
 
 - Clean, non-intrusive UI — hidden until summoned, blocks no gameplay when closed.
 
@@ -56,7 +56,21 @@ ATLAS Console is a lightweight in-game overlay and client mod for OGFN private s
 
 
 
-- **Console Enabled** — Spawns the Unreal Engine in-game console for direct command input.
+- **Enhanced UE-Style Console** — F8 or Unreal's normal backtick/tilde key cycles from a compact command field at the bottom to a full-screen, bottom-anchored console, then closes it. Running a command from the compact field closes it automatically. Recent lines grow upward from the bottom, with typed commands in white and server output in blue. Up/Down shows and navigates a compact monochrome history list.
+
+- **History and Completion** — Use Up/Down to browse prior commands and Tab to complete from recent or saved commands.
+
+- **Slash Commands** — `/give`, `/suicide`, and `/startaircraft` are dispatched as `cheat give`, `cheat suicide`, and `cheat startaircraft`.
+
+- **Bounded Output Capture** — ClientMessage-based Unreal and cheat replies are copied into a capped queue so output bursts cannot grow memory without limit.
+
+- **Game-Thread Command Dispatch** — Console, hotkey, and macro commands are handed through a one-command mailbox and executed from Unreal's game-thread tick. Rapid binds cannot re-enter ProcessEvent or stall the Present/render mutex.
+
+- **Balanced Mouse Hotkeys** — Mixed raw-mouse packets are routed as a complete packet, keeping every forwarded button-down paired with its release even when MOUSE4/MOUSE5 is assigned to an ATLAS command.
+
+- **Selectable Backend** — The Config tab switches between ATLAS Console and Original UE Console. ATLAS is the default and the preference is saved.
+
+  Close the active console before changing backends so Unreal can finish its own open/close state transition.
 
 - **Potato Graphics** — Applies `r.MipMapLODBias 7` for maximum FPS; revert restores `r.MipMapLODBias 0`.
 
@@ -70,7 +84,11 @@ ATLAS Console is a lightweight in-game overlay and client mod for OGFN private s
 
 
 
-- **Rebind GUI Key** — Reassign the overlay toggle to any F-key or navigation key.
+- **Rebind Menu Key** — Reassign the menu toggle (default: F9).
+
+- **Console Keys** — Uses F8 and Unreal's native backtick/tilde binding rather than a separate configurable ATLAS hotkey.
+
+- **Rebind Join Key** — Reassign quick Join (default: F5).
 
 - Binding is written to disk immediately and loaded on next inject.
 
@@ -86,9 +104,9 @@ ATLAS/
 
 +-- Private/
 
-|   +-- Client.cpp         Core hooks: EOR, ROR, pre-edit, respawn patching, cheat manager
+|   +-- Client.cpp         Core hooks, cheat-manager lifecycle, and bounded ClientMessage capture
 
-|   +-- dllmain.cpp        DLL entry point, DX11 present hook, ImGui initialisation
+|   +-- dllmain.cpp        DLL entry point, DX11/DX12 hooks, and synchronized ImGui input/rendering
 
 |   +-- GUI.cpp            Overlay render loop, section layout, console command dispatch
 
@@ -96,13 +114,13 @@ ATLAS/
 
 +-- Public/
 
-|   +-- Client.h           Client::Init declaration
+|   +-- Client.h           Client initialization and console-capture configuration
 
 |   +-- Configuration.h    Static configuration flags and values (FOV, respawn settings, etc.)
 
 |   +-- GUI.h              FGUI state struct, GUI_Init / GUI_Render / GUI_HandleInput declarations
 
-|   +-- GUI_Hotkey.h       Lightweight hotkey persistence (read/write %APPDATA%\\ATLAS\\settings.json)
+|   +-- Hotkey.h           Hotkey/command persistence (read/write %APPDATA%\\ATLAS\\console.json)
 
 |   +-- Utils.h            Hook helpers, memory patching utilities
 
@@ -160,6 +178,8 @@ ATLAS/
 
 4. The output DLL will be placed in `x64/Release/ATLAS.dll`.
 
+> ATLAS remains loaded for the process lifetime because its render and client hooks are not safe to unload live. Exit the game to unload it cleanly.
+
 
 
 > After modifying `pch.h`, always run **Build → Clean Solution** before rebuilding to force the precompiled header to regenerate.
@@ -179,7 +199,7 @@ The DLL is provided via ATLAS Link. If you are using our launcher, this is the d
 
 
 
-The GUI toggle hotkey is saved to:
+The console mode, menu and Join hotkeys, command binds, and macros are saved to:
 
 
 
@@ -198,14 +218,18 @@ Example file:
 ```json
 
 {
-  "hotkey": 120
+  "hotkey": 120,
+  "joinHotkey": 116,
+  "consoleMode": 0,
+  "commands": [],
+  "macros": []
 }
 
 ```
 
 
 
-The value is a Windows Virtual Key code (e.g. `120` = F9). This file is created automatically on first bind and read on every inject.
+Hotkeys use Windows Virtual Key codes (`120` = F9 and `116` = F5). `consoleMode` is `0` for ATLAS Console and `1` for Original UE Console. The file is created automatically and read on every inject.
 
 
 

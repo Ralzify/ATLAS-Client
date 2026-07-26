@@ -439,7 +439,24 @@ namespace HotkeyPersist
         return macros;
     }
 
-    inline void SaveAll(int hotkey, int joinHotkey, const std::vector<CommandBind>& commands,
+    inline int SanitizeConsoleMode(int mode)
+    {
+        return mode == 1 ? 1 : 0;
+    }
+
+    inline bool HasLegacyConsoleHotkey()
+    {
+        const std::string content = ReadFileContents();
+        return content.find("\"consoleHotkey\"") != std::string::npos;
+    }
+
+    inline int LoadLegacyConsoleHotkey()
+    {
+        return ParseKey(ReadFileContents(), "consoleHotkey", 0);
+    }
+
+    inline void SaveAll(int hotkey, int joinHotkey, int consoleMode,
+        const std::vector<CommandBind>& commands,
         const std::vector<CommandMacro>& macros = {})
     {
         auto path = GetSettingsPath();
@@ -451,6 +468,7 @@ namespace HotkeyPersist
         f << "{\n";
         f << "  \"hotkey\": " << hotkey << ",\n";
         f << "  \"joinHotkey\": " << joinHotkey << ",\n";
+        f << "  \"consoleMode\": " << SanitizeConsoleMode(consoleMode) << ",\n";
         f << "  \"commands\": [\n";
 
         for (size_t i = 0; i < commands.size(); i++)
@@ -511,12 +529,20 @@ namespace HotkeyPersist
         return ParseMacros(ReadFileContents());
     }
 
+    inline int LoadConsoleMode()
+    {
+        return SanitizeConsoleMode(
+            ParseIntField(ReadFileContents(), "consoleMode", 0));
+    }
+
     inline void Save(int vk, const char* key = "hotkey")
     {
         std::string content = ReadFileContents();
 
         int hotkey = ParseKey(content, "hotkey", VK_F9);
         int joinHotkey = ParseKey(content, "joinHotkey", VK_F5);
+        int consoleMode =
+            SanitizeConsoleMode(ParseIntField(content, "consoleMode", 0));
         std::vector<CommandBind> commands = ParseCommands(content);
         std::vector<CommandMacro> macros = ParseMacros(content);
 
@@ -525,13 +551,25 @@ namespace HotkeyPersist
         else if (strcmp(key, "joinHotkey") == 0)
             joinHotkey = vk;
 
-        SaveAll(hotkey, joinHotkey, commands, macros);
+        SaveAll(hotkey, joinHotkey, consoleMode, commands, macros);
+    }
+
+    inline void SaveConsoleMode(int consoleMode)
+    {
+        const std::string content = ReadFileContents();
+        SaveAll(ParseKey(content, "hotkey", VK_F9),
+            ParseKey(content, "joinHotkey", VK_F5),
+            SanitizeConsoleMode(consoleMode),
+            ParseCommands(content), ParseMacros(content));
     }
 
     inline void SaveCommands(const std::vector<CommandBind>& commands,
         const std::vector<CommandMacro>& macros = ParseMacros(ReadFileContents()))
     {
         std::string content = ReadFileContents();
-        SaveAll(ParseKey(content, "hotkey", VK_F9), ParseKey(content, "joinHotkey", VK_F5), commands, macros);
+        SaveAll(ParseKey(content, "hotkey", VK_F9),
+            ParseKey(content, "joinHotkey", VK_F5),
+            SanitizeConsoleMode(ParseIntField(content, "consoleMode", 0)),
+            commands, macros);
     }
 }

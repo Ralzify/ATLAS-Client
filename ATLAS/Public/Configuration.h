@@ -1,12 +1,20 @@
 #pragma once
 
 #include "../../SDK/Engine.h"
+#include <atomic>
+
+enum class EConsoleMode : int
+{
+	Atlas = 0,
+	Unreal = 1
+};
 
 struct FConfiguration
 {
-	static inline const char* ConsoleVersion = "v1.0.1";
+	static inline const char* ConsoleVersion = "v1.2.8";
 
-	static inline bool bConsoleEnabled = true;
+	static inline std::atomic_int ConsoleMode =
+		static_cast<int>(EConsoleMode::Atlas);
 	static inline bool bForceRespawns = true;
 	static inline bool bEnableIris = true;
 	static inline bool bEOREnabled = false;
