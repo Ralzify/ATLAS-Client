@@ -59,10 +59,35 @@ static std::atomic_bool g_DX12QueueHookInstalled = false;
 static bool g_LoggedUnsupportedRenderer = false;
 static bool g_LoggedDX12QueueWait = false;
 static bool g_WasVisible = false;
+static RECT g_PreOverlayCursorClip{};
+static bool g_HasPreOverlayCursorClip = false;
+static bool g_ShouldRestoreGameplayMouse = false;
 // Defaults to false so a process cannot accept hotkeys before Main has
 // classified it. The -nullrhi host keeps its server-side CheatManager setup,
 // but it must never consume or dispatch GUI input.
 static std::atomic_bool g_InteractiveInputEnabled = false;
+
+static UINT GetReleaseMouseCaptureMessage()
+{
+    static const UINT message =
+        RegisterWindowMessageW(
+            L"ATLAS.ReleaseMouseCapture");
+    return message;
+}
+
+static bool GameWindowHasMouseCapture(HWND window)
+{
+    if (!window)
+        return false;
+
+    const DWORD windowThreadId =
+        GetWindowThreadProcessId(window, nullptr);
+    GUITHREADINFO info{};
+    info.cbSize = sizeof(info);
+    return windowThreadId != 0 &&
+        GetGUIThreadInfo(windowThreadId, &info) != FALSE &&
+        info.hwndCapture == window;
+}
 
 static bool PinAtlasModule()
 {
@@ -222,15 +247,66 @@ static void HandleOverlayInput()
     {
         if (overlayVisible)
         {
+            GUI_CancelGameplayMouseRestore();
+            g_HasPreOverlayCursorClip =
+                windowActive &&
+                GetClipCursor(&g_PreOverlayCursorClip) != FALSE;
+            RECT virtualDesktop{
+                GetSystemMetrics(SM_XVIRTUALSCREEN),
+                GetSystemMetrics(SM_YVIRTUALSCREEN),
+                GetSystemMetrics(SM_XVIRTUALSCREEN) +
+                    GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                GetSystemMetrics(SM_YVIRTUALSCREEN) +
+                    GetSystemMetrics(SM_CYVIRTUALSCREEN)
+            };
+            const bool cursorWasConfined =
+                g_HasPreOverlayCursorClip &&
+                !EqualRect(
+                    &g_PreOverlayCursorClip,
+                    &virtualDesktop);
+            CURSORINFO cursorInfo{};
+            cursorInfo.cbSize = sizeof(cursorInfo);
+            const bool cursorWasHidden =
+                GetCursorInfo(&cursorInfo) != FALSE &&
+                (cursorInfo.flags & CURSOR_SHOWING) == 0;
+            g_ShouldRestoreGameplayMouse =
+                windowActive &&
+                (cursorWasConfined ||
+                    cursorWasHidden ||
+                    GameWindowHasMouseCapture(g_hWnd));
             ClipCursor(nullptr);
-            ReleaseCapture();
+            const UINT releaseCaptureMessage =
+                GetReleaseMouseCaptureMessage();
+            if (g_hWnd && releaseCaptureMessage != 0)
+            {
+                // Mouse capture belongs to the HWND thread, which may differ
+                // from Present's render thread. Release it in HookedWndProc.
+                PostMessageW(
+                    g_hWnd,
+                    releaseCaptureMessage,
+                    0,
+                    0);
+            }
             ShowCursor(TRUE);
         }
         else
         {
             ShowCursor(FALSE);
-            if (g_hWnd)
-                SetForegroundWindow(g_hWnd);
+            if (windowActive && g_hWnd)
+            {
+                if (g_HasPreOverlayCursorClip)
+                {
+                    // Opening ATLAS temporarily removes Unreal's gameplay
+                    // confinement. Restore the exact pre-overlay rectangle so
+                    // the hardware cursor cannot escape before the game-thread
+                    // input-mode restore runs.
+                    ClipCursor(&g_PreOverlayCursorClip);
+                }
+                if (g_ShouldRestoreGameplayMouse)
+                    GUI_RequestGameplayMouseRestore(g_hWnd);
+            }
+            g_HasPreOverlayCursorClip = false;
+            g_ShouldRestoreGameplayMouse = false;
         }
 
         g_WasVisible = overlayVisible;
@@ -877,6 +953,16 @@ static ERawInputDestination RouteRawInput(
 
 static LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
+    const UINT releaseCaptureMessage =
+        GetReleaseMouseCaptureMessage();
+    if (releaseCaptureMessage != 0 &&
+        msg == releaseCaptureMessage)
+    {
+        if (hWnd == g_hWnd && GUI_IsOverlayVisible())
+            ReleaseCapture();
+        return 0;
+    }
+
     const bool interactiveInput = g_InteractiveInputEnabled.load(std::memory_order_acquire);
     const bool imguiReady = g_ImGuiReady.load(std::memory_order_acquire);
     const bool losingCapture =

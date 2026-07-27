@@ -4,6 +4,7 @@
 #include <ShlObj.h>
 #include <cstdarg>
 #include <cstdio>
+#include <mutex>
 #include <string>
 
 namespace AtlasDiagnostics
@@ -19,6 +20,21 @@ namespace AtlasDiagnostics
         }
 
         return L"atlas-diagnostics.log";
+    }
+
+    inline HANDLE GetFileHandle()
+    {
+        // Diagnostics can be written for every bound console command. Resolve
+        // AppData and open the append handle once instead of doing synchronous
+        // shell/path/file work on the game's command-dispatch thread each time.
+        static HANDLE file = []
+            {
+                const std::wstring path = GetPath();
+                return CreateFileW(path.c_str(), FILE_APPEND_DATA,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
+                    FILE_ATTRIBUTE_NORMAL, nullptr);
+            }();
+        return file;
     }
 
     inline void WriteLine(const char* format, ...)
@@ -40,16 +56,14 @@ namespace AtlasDiagnostics
         if (length <= 0)
             return;
 
-        const std::wstring path = GetPath();
-        HANDLE file = CreateFileW(path.c_str(), FILE_APPEND_DATA,
-            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
-            FILE_ATTRIBUTE_NORMAL, nullptr);
+        HANDLE file = GetFileHandle();
         if (file == INVALID_HANDLE_VALUE)
             return;
 
+        static std::mutex writeMutex;
+        std::lock_guard<std::mutex> lock(writeMutex);
         DWORD written = 0;
         WriteFile(file, line, static_cast<DWORD>(min(length, (int)sizeof(line))), &written, nullptr);
-        CloseHandle(file);
     }
 
     inline void BeginSession(const char* build)

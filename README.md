@@ -56,13 +56,13 @@ ATLAS Console is a lightweight in-game overlay and client mod for OGFN private s
 
 
 
-- **Enhanced UE-Style Console** — F8 or Unreal's normal backtick/tilde key cycles from a compact command field at the bottom to a full-screen, bottom-anchored console, then closes it. Running a command from the compact field closes it automatically. Recent lines grow upward from the bottom, with typed commands in white and server output in blue. Up/Down shows and navigates a compact monochrome history list.
+- **Enhanced UE-Style Console** — F8 or Unreal's normal backtick/tilde key cycles from a compact command field at the bottom to a full-screen, bottom-anchored console, then closes it. Running a command from the compact field closes it automatically. Recent lines grow upward from the bottom with native-style command spacing and white text, and the bar includes a compact log-clear control. Up/Down shows and navigates a compact monochrome history list.
 
 - **History and Completion** — Use Up/Down to browse prior commands and Tab to complete from recent or saved commands.
 
 - **Slash Commands** — `/give`, `/suicide`, and `/startaircraft` are dispatched as `cheat give`, `cheat suicide`, and `cheat startaircraft`.
 
-- **Bounded Output Capture** — ClientMessage-based Unreal and cheat replies are copied into a capped queue so output bursts cannot grow memory without limit.
+- **Bounded Output Capture** — Native UE4 console responses and asynchronous ClientMessage/cheat replies are copied into a capped queue so output bursts cannot grow memory without limit.
 
 - **Game-Thread Command Dispatch** — Console, hotkey, and macro commands are handed through a one-command mailbox and executed from Unreal's game-thread tick. Rapid binds cannot re-enter ProcessEvent or stall the Present/render mutex.
 

@@ -14,6 +14,8 @@ void GUI_Render();
 void GUI_HandleInput(bool windowActive);
 void GUI_SetGameThreadDispatcherReady(bool ready);
 void GUI_PumpGameThreadCommands();
+void GUI_RequestGameplayMouseRestore(HWND gameWindow);
+void GUI_CancelGameplayMouseRestore();
 void GUI_QueueInputMessage(UINT message, WPARAM wParam, LPARAM lParam);
 bool GUI_ShouldConsumeInputMessage(UINT message, WPARAM wParam);
 bool GUI_IsOwnedHotkey(int vk);

@@ -8,7 +8,6 @@
 #include "../Public/GUI.h"
 
 #include <atomic>
-#include <limits>
 
 inline void* (*SelectResetOG)(void*) = nullptr;
 inline void* (*SelectEditOG)(void*) = nullptr;
@@ -31,42 +30,6 @@ struct FClientMessageView
 	int32_t MaxElements;
 };
 
-static bool IsReadableRange(const void* address, size_t length)
-{
-	if (!address || length == 0)
-		return false;
-
-	const uintptr_t begin = reinterpret_cast<uintptr_t>(address);
-	if (length > (std::numeric_limits<uintptr_t>::max)() - begin)
-		return false;
-
-	const uintptr_t end = begin + length;
-	uintptr_t current = begin;
-	while (current < end)
-	{
-		MEMORY_BASIC_INFORMATION region{};
-		if (VirtualQuery(reinterpret_cast<const void*>(current), &region, sizeof(region)) != sizeof(region) ||
-			region.State != MEM_COMMIT ||
-			(region.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0 ||
-			region.RegionSize == 0)
-		{
-			return false;
-		}
-
-		const uintptr_t regionBegin = reinterpret_cast<uintptr_t>(region.BaseAddress);
-		if (region.RegionSize > (std::numeric_limits<uintptr_t>::max)() - regionBegin)
-			return false;
-
-		const uintptr_t regionEnd = regionBegin + region.RegionSize;
-		if (regionEnd <= current)
-			return false;
-
-		current = (std::min)(end, regionEnd);
-	}
-
-	return true;
-}
-
 static bool IsDirectClientMessageFrame(const FFrame* stack, const UFunction* function)
 {
 	__try
@@ -81,7 +44,7 @@ static bool IsDirectClientMessageFrame(const FFrame* stack, const UFunction* fun
 
 static bool TryReadClientMessageView(const FString* message, FClientMessageView* view)
 {
-	if (!view || !IsReadableRange(message, sizeof(FString)))
+	if (!message || !view)
 		return false;
 
 	__try
@@ -99,8 +62,7 @@ static bool TryReadClientMessageView(const FString* message, FClientMessageView*
 		view->NumElements > 0 &&
 		view->NumElements <= 16384 &&
 		view->MaxElements >= view->NumElements &&
-		view->MaxElements <= 65536 &&
-		IsReadableRange(view->Data, static_cast<size_t>(view->NumElements) * sizeof(wchar_t));
+		view->MaxElements <= 65536;
 }
 
 static bool TryCopyClientMessage(const wchar_t* source, wchar_t* destination, size_t length)
@@ -149,8 +111,22 @@ static bool LooksLikeServerCommandList(
 
 static void CaptureClientMessage(UObject* context, FFrame& stack, void* result)
 {
-	const UFunction* function = g_ClientMessageFunction.load(std::memory_order_acquire);
-	const uint32_t textOffset = g_ClientMessageTextOffset.load(std::memory_order_acquire);
+	// ClientMessage is a hot path during travel and gameplay. Keep capture
+	// active in Atlas mode even while its tiny bar is hidden so background
+	// output (notably outputge) remains available when the console is reopened.
+	// Original-console mode remains fully isolated from Atlas capture.
+	const bool shouldCapture =
+		FConfiguration::ConsoleMode.load(std::memory_order_acquire) ==
+			static_cast<int>(EConsoleMode::Atlas);
+
+	const UFunction* function =
+		shouldCapture
+			? g_ClientMessageFunction.load(std::memory_order_acquire)
+			: nullptr;
+	const uint32_t textOffset =
+		shouldCapture
+			? g_ClientMessageTextOffset.load(std::memory_order_acquire)
+			: UINT32_MAX;
 	if (function && textOffset != UINT32_MAX && IsDirectClientMessageFrame(&stack, function))
 	{
 		const FString* message = reinterpret_cast<const FString*>(stack.Locals + textOffset);
@@ -391,16 +367,6 @@ static ULONGLONG g_NextViewportConsoleAttemptAt = 0;
 static ULONGLONG g_NextPlaylistClassResolveAt = 0;
 static ULONGLONG g_NextPlaylistScanRetryAt = 0;
 
-static void RearmClientPlaylistInitialization()
-{
-	g_PlaylistInitializationComplete = false;
-	g_PlaylistScanIndex = 0;
-	g_PlaylistMatchCount = 0;
-	g_NextPlaylistScanRetryAt = 0;
-	g_ClientUObjectInitializationPending.store(
-		true, std::memory_order_release);
-}
-
 static void InitializePlaylistExtensions()
 {
 	if (g_PlaylistExtensionsInitialized ||
@@ -586,7 +552,10 @@ static void InitializeClientUObjects()
 				// The global object array can contain hundreds of thousands
 				// of entries. Scan it in bounded slices so initialization
 				// cannot stall one game-thread frame.
-				constexpr int kPlaylistObjectsPerTick = 2048;
+				// Playlist defaults live for the process lifetime. Keep this
+				// one-time compatibility scan far below a frame-sized burst;
+				// FN30 can have more than half a million UObjects here.
+				constexpr int kPlaylistObjectsPerTick = 128;
 				const int objectCount = TUObjectArray::Num();
 				const int end = (std::min)(
 					g_PlaylistScanIndex +
@@ -664,7 +633,6 @@ static void ClientGameThreadTick()
 		observedSessionController = nullptr;
 		g_ServerCommandListReceived.store(
 			false, std::memory_order_release);
-		RearmClientPlaylistInitialization();
 	}
 
 	if (!playerController)

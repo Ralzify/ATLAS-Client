@@ -38,6 +38,7 @@ enum class EConsoleLineKind : uint8_t
 {
     Output,
     Command,
+    Spacer,
     System,
     Error
 };
@@ -175,22 +176,34 @@ static EConsoleLineKind ClassifyConsoleOutput(const std::string& text)
 
 static void AppendConsoleLine(EConsoleLineKind kind, std::string text)
 {
-    while (!text.empty() && (text.back() == '\r' || text.back() == '\n' || text.back() == '\0'))
-        text.pop_back();
-
-    if (text.empty())
-        return;
-
-    if (text.size() > kMaximumConsoleLineLength)
+    const bool isSpacer = kind == EConsoleLineKind::Spacer;
+    if (!isSpacer)
     {
-        text.resize(kMaximumConsoleLineLength - 14);
-        text += " ...[truncated]";
+        while (!text.empty() &&
+            (text.back() == '\r' || text.back() == '\n' ||
+                text.back() == '\0'))
+        {
+            text.pop_back();
+        }
+
+        if (text.empty())
+            return;
+
+        if (text.size() > kMaximumConsoleLineLength)
+        {
+            text.resize(kMaximumConsoleLineLength - 14);
+            text += " ...[truncated]";
+        }
     }
 
     SYSTEMTIME now{};
-    GetLocalTime(&now);
     char timestamp[16]{};
-    snprintf(timestamp, sizeof(timestamp), "%02u:%02u:%02u", now.wHour, now.wMinute, now.wSecond);
+    if (!isSpacer)
+    {
+        GetLocalTime(&now);
+        snprintf(timestamp, sizeof(timestamp), "%02u:%02u:%02u",
+            now.wHour, now.wMinute, now.wSecond);
+    }
 
     FConsoleLine line{};
     line.Id = g_NextConsoleLineId++;
@@ -299,6 +312,48 @@ static void DrainConsoleOutput()
             ? g_ConsoleDrainCarry.size()
             : end + 1;
     }
+}
+
+static void AppendConsoleCommandEcho(
+    const std::string& command)
+{
+    // Flush output produced by the previous command before placing the next
+    // command boundary. This keeps hotkey-triggered output grouped even when
+    // the console is closed between key presses.
+    DrainConsoleOutput();
+
+    if (!g_ConsoleLines.empty() &&
+        g_ConsoleLines.back().Kind != EConsoleLineKind::Spacer)
+    {
+        AppendConsoleLine(EConsoleLineKind::Spacer, {});
+    }
+
+    if (!command.empty())
+    {
+        AppendConsoleLine(
+            EConsoleLineKind::Command,
+            "> " + command);
+    }
+
+    g_ConsoleUi.ScrollToBottom = true;
+}
+
+static void ClearConsoleLogs()
+{
+    {
+        std::lock_guard<std::mutex> lock(g_ConsolePendingMutex);
+        g_ConsolePending.clear();
+        g_ConsolePendingBytes = 0;
+    }
+
+    g_ConsoleDroppedMessages.store(0, std::memory_order_release);
+    g_ConsoleDrainCarry.clear();
+    g_ConsoleDrainOffset = 0;
+    g_ConsoleLines.clear();
+    g_ConsoleLineBytes = 0;
+    g_ConsoleLineRevision++;
+    g_ConsoleUi.ScrollToBottom = false;
+    g_ConsoleUi.WasAtBottom = true;
 }
 
 static const char* VKName(int vk)
@@ -867,6 +922,970 @@ static void QueueCommandError(const wchar_t* message)
     GUI_QueueConsoleOutput(message, static_cast<int>(wcslen(message)));
 }
 
+
+static bool IsExecutableAddress(const void* address)
+{
+    if (!address)
+        return false;
+
+    MEMORY_BASIC_INFORMATION region{};
+    if (VirtualQuery(
+            address, &region, sizeof(region)) !=
+        sizeof(region))
+    {
+        return false;
+    }
+
+    const DWORD executableProtection =
+        PAGE_EXECUTE | PAGE_EXECUTE_READ |
+        PAGE_EXECUTE_READWRITE |
+        PAGE_EXECUTE_WRITECOPY;
+    return region.State == MEM_COMMIT &&
+        (region.Protect &
+            (PAGE_GUARD | PAGE_NOACCESS)) == 0 &&
+        (region.Protect & executableProtection) != 0;
+}
+
+static bool IsReadableRange(
+    const void* address,
+    size_t length)
+{
+    if (!address || length == 0)
+        return false;
+
+    const uintptr_t begin =
+        reinterpret_cast<uintptr_t>(address);
+    if (length > SIZE_MAX - begin)
+        return false;
+
+    const uintptr_t end = begin + length;
+    uintptr_t current = begin;
+    while (current < end)
+    {
+        MEMORY_BASIC_INFORMATION region{};
+        if (VirtualQuery(
+                reinterpret_cast<const void*>(current),
+                &region, sizeof(region)) !=
+                sizeof(region) ||
+            region.State != MEM_COMMIT ||
+            (region.Protect &
+                (PAGE_GUARD | PAGE_NOACCESS)) != 0 ||
+            region.RegionSize == 0)
+        {
+            return false;
+        }
+
+        const uintptr_t regionBegin =
+            reinterpret_cast<uintptr_t>(
+                region.BaseAddress);
+        if (region.RegionSize >
+            SIZE_MAX - regionBegin)
+        {
+            return false;
+        }
+
+        const uintptr_t regionEnd =
+            regionBegin + region.RegionSize;
+        if (regionEnd <= current)
+            return false;
+
+        current = (std::min)(end, regionEnd);
+    }
+    return true;
+}
+
+// UE4's Kismet ExecuteConsoleCommand ultimately invokes the virtual
+// APlayerController::ConsoleCommand method with bWriteToLog=true, which throws
+// away the FString it builds. Resolve that exact virtual slot from Kismet's
+// native implementation and call it with bWriteToLog=false so the normal UE
+// response can be copied into the ATLAS console without intercepting an
+// uncertain UConsole vtable entry.
+using PlayerConsoleCommandNative =
+    FString*(*)(UObject*, FString*, const FString*, bool);
+
+static std::atomic_size_t g_PlayerConsoleCommandIndex = SIZE_MAX;
+static ULONGLONG g_NextPlayerConsoleCommandResolveAt = 0;
+
+static bool GetBoundedFunctionRange(
+    uintptr_t address,
+    size_t maximumSize,
+    uintptr_t* functionStart,
+    uintptr_t* functionEnd)
+{
+    if (!address || !functionStart || !functionEnd ||
+        !IsExecutableAddress(
+            reinterpret_cast<void*>(address)))
+    {
+        return false;
+    }
+
+    DWORD64 imageBase = 0;
+    const PRUNTIME_FUNCTION runtimeFunction =
+        RtlLookupFunctionEntry(
+            static_cast<DWORD64>(address),
+            &imageBase, nullptr);
+    if (!runtimeFunction || !imageBase)
+        return false;
+
+    const uintptr_t start =
+        static_cast<uintptr_t>(
+            imageBase + runtimeFunction->BeginAddress);
+    const uintptr_t end =
+        static_cast<uintptr_t>(
+            imageBase + runtimeFunction->EndAddress);
+    if (address < start || address >= end ||
+        end <= start ||
+        static_cast<size_t>(end - start) >
+            maximumSize)
+    {
+        return false;
+    }
+
+    *functionStart = start;
+    *functionEnd = end;
+    return true;
+}
+
+static uintptr_t FollowSimpleJump(uintptr_t address)
+{
+    for (unsigned int depth = 0; depth < 2; depth++)
+    {
+        if (!IsExecutableAddress(
+                reinterpret_cast<void*>(address)))
+        {
+            return 0;
+        }
+
+        __try
+        {
+            const auto bytes =
+                reinterpret_cast<const uint8_t*>(address);
+            if (bytes[0] == 0xE9)
+            {
+                const int32_t relative =
+                    *reinterpret_cast<const int32_t*>(
+                        address + 1);
+                address = address + 5 + relative;
+                continue;
+            }
+
+            if (bytes[0] == 0xFF &&
+                bytes[1] == 0x25)
+            {
+                const int32_t relative =
+                    *reinterpret_cast<const int32_t*>(
+                        address + 2);
+                address =
+                    *reinterpret_cast<const uintptr_t*>(
+                        address + 6 + relative);
+                continue;
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return 0;
+        }
+
+        break;
+    }
+    return address;
+}
+
+static bool DecodeRegisterMove(
+    const uint8_t* bytes,
+    unsigned int* destination,
+    unsigned int* source)
+{
+    if (!bytes || !destination || !source)
+        return false;
+
+    const uint8_t rex = bytes[0];
+    if ((rex & 0xF8) != 0x48)
+        return false;
+
+    const uint8_t opcode = bytes[1];
+    const uint8_t modRm = bytes[2];
+    if ((opcode != 0x8B && opcode != 0x89) ||
+        (modRm & 0xC0) != 0xC0)
+    {
+        return false;
+    }
+
+    const unsigned int reg =
+        ((modRm >> 3) & 7u) |
+        ((rex & 0x04) ? 8u : 0u);
+    const unsigned int rm =
+        (modRm & 7u) |
+        ((rex & 0x01) ? 8u : 0u);
+    if (opcode == 0x8B)
+    {
+        *destination = reg;
+        *source = rm;
+    }
+    else
+    {
+        *destination = rm;
+        *source = reg;
+    }
+    return true;
+}
+
+static bool LooksLikePlayerConsoleCommand(
+    uintptr_t target,
+    uint32_t playerOffset)
+{
+    target = FollowSimpleJump(target);
+    if (!target || playerOffset == UINT32_MAX)
+        return false;
+
+    uintptr_t functionStart = 0;
+    uintptr_t functionEnd = 0;
+    if (!GetBoundedFunctionRange(
+            target, 0x100,
+            &functionStart, &functionEnd))
+    {
+        return false;
+    }
+
+    // A vtable entry must point at the beginning of the resolved runtime
+    // function (after following a short import/hot-patch jump). Rejecting
+    // interior addresses prevents an unrelated byte sequence from being
+    // treated as a complete ConsoleCommand wrapper.
+    if (target != functionStart)
+        return false;
+
+    uintptr_t savesResultAt = 0;
+    uintptr_t loadsPlayerAt = 0;
+    uintptr_t testsPlayerAt = 0;
+    uintptr_t callsPlayerAt = 0;
+    uintptr_t restoresResultAt = 0;
+    uintptr_t returnsAt = 0;
+    int savedResultRegister = -1;
+
+    __try
+    {
+        for (uintptr_t cursor = functionStart;
+            cursor < functionEnd; cursor++)
+        {
+            const auto bytes =
+                reinterpret_cast<const uint8_t*>(cursor);
+
+            unsigned int destination = 0;
+            unsigned int source = 0;
+            if (cursor + 3 <= functionEnd &&
+                DecodeRegisterMove(
+                    bytes, &destination, &source))
+            {
+                if (!savesResultAt &&
+                    cursor - functionStart <= 32 &&
+                    source == 2 &&
+                    (destination == 3 ||
+                        destination == 5 ||
+                        destination == 6 ||
+                        destination == 7 ||
+                        destination >= 12))
+                {
+                    savesResultAt = cursor;
+                    savedResultRegister =
+                        static_cast<int>(destination);
+                }
+
+                if (callsPlayerAt &&
+                    !restoresResultAt &&
+                    destination == 0 &&
+                    savedResultRegister >= 0 &&
+                    source ==
+                        static_cast<unsigned int>(
+                            savedResultRegister))
+                {
+                    restoresResultAt = cursor;
+                }
+            }
+
+            if (!loadsPlayerAt &&
+                cursor - functionStart <= 32 &&
+                ((cursor + 7 <= functionEnd &&
+                    bytes[0] == 0x48 &&
+                    bytes[1] == 0x8B &&
+                    bytes[2] == 0x89 &&
+                    *reinterpret_cast<const uint32_t*>(
+                        cursor + 3) == playerOffset) ||
+                    (cursor + 4 <= functionEnd &&
+                        bytes[0] == 0x48 &&
+                        bytes[1] == 0x8B &&
+                        bytes[2] == 0x49 &&
+                        playerOffset <= 0x7F &&
+                        bytes[3] ==
+                            static_cast<uint8_t>(
+                                playerOffset))))
+            {
+                loadsPlayerAt = cursor;
+            }
+
+            if (!testsPlayerAt &&
+                loadsPlayerAt &&
+                savesResultAt &&
+                cursor > (std::max)(
+                    loadsPlayerAt, savesResultAt) &&
+                cursor - (std::max)(
+                    loadsPlayerAt, savesResultAt) <= 12 &&
+                cursor + 3 <= functionEnd &&
+                bytes[0] == 0x48 &&
+                bytes[1] == 0x85 &&
+                bytes[2] == 0xC9)
+            {
+                testsPlayerAt = cursor;
+            }
+
+            if (!callsPlayerAt &&
+                testsPlayerAt &&
+                cursor > testsPlayerAt &&
+                cursor - testsPlayerAt <= 16 &&
+                bytes[0] == 0xE8 &&
+                cursor + 5 <= functionEnd)
+            {
+                callsPlayerAt = cursor;
+            }
+
+            if (!returnsAt &&
+                restoresResultAt &&
+                cursor > restoresResultAt &&
+                cursor - restoresResultAt <= 16 &&
+                bytes[0] == 0xC3)
+            {
+                returnsAt = cursor;
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+
+    return savesResultAt &&
+        loadsPlayerAt &&
+        ((savesResultAt > loadsPlayerAt
+                ? savesResultAt - loadsPlayerAt
+                : loadsPlayerAt - savesResultAt) <= 16) &&
+        testsPlayerAt &&
+        callsPlayerAt &&
+        restoresResultAt &&
+        returnsAt;
+}
+
+static uintptr_t FindResultBufferWrite(
+    uintptr_t start,
+    uintptr_t end)
+{
+    for (uintptr_t cursor = start;
+        cursor + 5 <= end; cursor++)
+    {
+        const auto bytes =
+            reinterpret_cast<const uint8_t*>(cursor);
+        if (bytes[0] == 0x48 &&
+            bytes[1] == 0x8D &&
+            bytes[2] == 0x54 &&
+            bytes[3] == 0x24)
+        {
+            return cursor;
+        }
+
+        if (cursor + 8 <= end &&
+            bytes[0] == 0x48 &&
+            bytes[1] == 0x8D &&
+            bytes[2] == 0x94 &&
+            bytes[3] == 0x24)
+        {
+            return cursor;
+        }
+    }
+    return 0;
+}
+
+static uintptr_t FindR9One(
+    uintptr_t start,
+    uintptr_t end)
+{
+    for (uintptr_t cursor = start;
+        cursor + 3 <= end; cursor++)
+    {
+        const auto bytes =
+            reinterpret_cast<const uint8_t*>(cursor);
+        if (bytes[0] == 0x41 &&
+            bytes[1] == 0xB1 &&
+            bytes[2] == 0x01)
+        {
+            return cursor;
+        }
+
+        if (cursor + 6 <= end &&
+            bytes[0] == 0x41 &&
+            bytes[1] == 0xB9 &&
+            *reinterpret_cast<const uint32_t*>(
+                cursor + 2) == 1)
+        {
+            return cursor;
+        }
+    }
+    return 0;
+}
+
+static uintptr_t FindR8Write(
+    uintptr_t start,
+    uintptr_t end)
+{
+    for (uintptr_t cursor = start;
+        cursor + 3 <= end; cursor++)
+    {
+        const auto bytes =
+            reinterpret_cast<const uint8_t*>(cursor);
+        const uint8_t rex = bytes[0];
+        if ((rex & 0xF8) == 0x48 &&
+            (rex & 0x04) != 0 &&
+            (bytes[1] == 0x8B ||
+                bytes[1] == 0x8D) &&
+            (bytes[2] & 0x38) == 0)
+        {
+            return cursor;
+        }
+    }
+    return 0;
+}
+
+static bool DecodeVtableLoad(
+    const uint8_t* bytes,
+    unsigned int* vtableRegister,
+    unsigned int* controllerRegister)
+{
+    if (!bytes || !vtableRegister ||
+        !controllerRegister)
+        return false;
+
+    const uint8_t rex = bytes[0];
+    const uint8_t modRm = bytes[2];
+    if ((rex & 0xF8) != 0x48 ||
+        bytes[1] != 0x8B ||
+        (modRm & 0xC0) != 0 ||
+        (modRm & 7u) == 4u ||
+        (modRm & 7u) == 5u)
+    {
+        return false;
+    }
+
+    *vtableRegister =
+        ((modRm >> 3) & 7u) |
+        ((rex & 0x04) ? 8u : 0u);
+    *controllerRegister =
+        (modRm & 7u) |
+        ((rex & 0x01) ? 8u : 0u);
+    return true;
+}
+
+static bool DecodeVirtualCall(
+    uintptr_t address,
+    uintptr_t end,
+    unsigned int* vtableRegister,
+    uint32_t* byteOffset,
+    size_t* instructionLength)
+{
+    if (!address || !vtableRegister ||
+        !byteOffset || !instructionLength ||
+        address >= end)
+    {
+        return false;
+    }
+
+    const auto start =
+        reinterpret_cast<const uint8_t*>(address);
+    size_t prefixLength = 0;
+    uint8_t rex = 0;
+    if ((start[0] & 0xF0) == 0x40)
+    {
+        rex = start[0];
+        prefixLength = 1;
+    }
+
+    if (address + prefixLength + 6 > end)
+        return false;
+
+    const auto bytes = start + prefixLength;
+    const uint8_t modRm = bytes[1];
+    if (bytes[0] != 0xFF ||
+        (modRm & 0xC0) != 0x80 ||
+        ((modRm >> 3) & 7u) != 2u ||
+        (rex & 0x06) != 0)
+    {
+        return false;
+    }
+
+    const unsigned int rm = modRm & 7u;
+    size_t displacementOffset = 2;
+    unsigned int baseRegister = rm;
+    if (rm == 4u)
+    {
+        if (address + prefixLength + 7 > end)
+            return false;
+
+        const uint8_t sib = bytes[2];
+        // A vtable call only needs a base register. Reject indexed SIB forms
+        // so an unrelated array-style indirect call cannot qualify.
+        if (((sib >> 3) & 7u) != 4u ||
+            (rex & 0x02) != 0)
+        {
+            return false;
+        }
+        baseRegister = sib & 7u;
+        displacementOffset = 3;
+    }
+
+    baseRegister |=
+        (rex & 0x01) ? 8u : 0u;
+    *vtableRegister = baseRegister;
+    *byteOffset =
+        *reinterpret_cast<const uint32_t*>(
+            bytes + displacementOffset);
+    *instructionLength =
+        prefixLength + displacementOffset + 4;
+    return true;
+}
+
+static bool MatchesPlayerConsoleCallSite(
+    uintptr_t start,
+    uintptr_t call,
+    unsigned int callVtableRegister)
+{
+    // Known optimized UE4 builds emit this dataflow in order:
+    //   vtable load -> result buffer -> true -> command -> this -> call.
+    // Requiring both the order and short instruction gaps avoids combining
+    // unrelated bytes from the surrounding implementation.
+    for (uintptr_t vtableLoad = start;
+        vtableLoad + 3 <= call; vtableLoad++)
+    {
+        unsigned int vtableRegister = 0;
+        unsigned int controllerRegister = 0;
+        if (!DecodeVtableLoad(
+                reinterpret_cast<const uint8_t*>(
+                    vtableLoad),
+                &vtableRegister,
+                &controllerRegister))
+        {
+            continue;
+        }
+        if (vtableRegister != callVtableRegister)
+            continue;
+
+        const uintptr_t resultBuffer =
+            FindResultBufferWrite(
+                vtableLoad + 3,
+                (std::min)(call, vtableLoad + 15));
+        if (!resultBuffer)
+            continue;
+
+        const uintptr_t r9One =
+            FindR9One(
+                resultBuffer + 3,
+                (std::min)(call, resultBuffer + 15));
+        if (!r9One)
+            continue;
+
+        const uintptr_t r8Write =
+            FindR8Write(
+                r9One + 3,
+                (std::min)(call, r9One + 15));
+        if (!r8Write)
+            continue;
+
+        for (uintptr_t restoresRcx = r8Write + 3;
+            restoresRcx + 3 <= call &&
+                restoresRcx < r8Write + 15;
+            restoresRcx++)
+        {
+            unsigned int destination = 0;
+            unsigned int source = 0;
+            if (DecodeRegisterMove(
+                    reinterpret_cast<const uint8_t*>(
+                        restoresRcx),
+                    &destination, &source) &&
+                destination == 1 &&
+                source == controllerRegister &&
+                call - restoresRcx <= 8)
+            {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static bool FindPlayerConsoleCommandIndex(
+    uintptr_t implementation,
+    UObject* controller,
+    size_t* resolvedIndex)
+{
+    if (!controller || !controller->Vft ||
+        !resolvedIndex)
+    {
+        return false;
+    }
+
+    uintptr_t functionStart = 0;
+    uintptr_t functionEnd = 0;
+    implementation = FollowSimpleJump(implementation);
+    if (!implementation ||
+        !GetBoundedFunctionRange(
+            implementation, 0x1000,
+            &functionStart, &functionEnd))
+    {
+        return false;
+    }
+
+    const uint32_t playerOffset =
+        controller->GetOffset("Player");
+    if (playerOffset == UINT32_MAX)
+        return false;
+
+    size_t uniqueIndex = SIZE_MAX;
+    __try
+    {
+        for (uintptr_t call = functionStart;
+            call < functionEnd; call++)
+        {
+            unsigned int callVtableRegister = 0;
+            uint32_t byteOffset = 0;
+            size_t callLength = 0;
+            if (!DecodeVirtualCall(
+                    call, functionEnd,
+                    &callVtableRegister,
+                    &byteOffset,
+                    &callLength))
+            {
+                continue;
+            }
+
+            if (callLength < 6 ||
+                (byteOffset & 7u) != 0)
+            {
+                continue;
+            }
+
+            const size_t index =
+                static_cast<size_t>(byteOffset / 8u);
+            if (index >= 768)
+                continue;
+
+            const uintptr_t windowStart =
+                call > functionStart + 48
+                    ? call - 48
+                    : functionStart;
+            if (!MatchesPlayerConsoleCallSite(
+                    windowStart, call,
+                    callVtableRegister))
+            {
+                continue;
+            }
+
+            const uintptr_t target =
+                reinterpret_cast<uintptr_t>(
+                    controller->Vft[index]);
+            if (!LooksLikePlayerConsoleCommand(
+                    target, playerOffset))
+            {
+                continue;
+            }
+
+            if (uniqueIndex != SIZE_MAX &&
+                uniqueIndex != index)
+            {
+                return false;
+            }
+            uniqueIndex = index;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+
+    if (uniqueIndex == SIZE_MAX)
+        return false;
+
+    *resolvedIndex = uniqueIndex;
+    return true;
+}
+
+static bool TryResolvePlayerConsoleCommand(
+    UObject* controller)
+{
+    if (g_PlayerConsoleCommandIndex.load(
+            std::memory_order_acquire) != SIZE_MAX)
+    {
+        return true;
+    }
+
+    const ULONGLONG now = GetTickCount64();
+    if (now < g_NextPlayerConsoleCommandResolveAt)
+        return false;
+    g_NextPlayerConsoleCommandResolveAt = now + 1000;
+
+    auto library =
+        UKismetSystemLibrary::GetDefaultObj();
+    UFunction* function =
+        library
+            ? library->GetFunction(
+                "ExecuteConsoleCommand")
+            : nullptr;
+    const uintptr_t nativeWrapper =
+        function
+            ? reinterpret_cast<uintptr_t>(
+                function->GetNativeFunc())
+            : 0;
+
+    uintptr_t wrapperStart = 0;
+    uintptr_t wrapperEnd = 0;
+    if (!nativeWrapper ||
+        !GetBoundedFunctionRange(
+            nativeWrapper, 0x1000,
+            &wrapperStart, &wrapperEnd))
+    {
+        return false;
+    }
+
+    size_t resolvedIndex = SIZE_MAX;
+    bool sawSetNotZero = false;
+    __try
+    {
+        for (uintptr_t cursor = wrapperStart;
+            cursor < wrapperEnd; cursor++)
+        {
+            const auto bytes =
+                reinterpret_cast<const uint8_t*>(cursor);
+            if (cursor + 2 <= wrapperEnd &&
+                bytes[0] == 0x0F &&
+                bytes[1] == 0x95)
+            {
+                sawSetNotZero = true;
+                continue;
+            }
+
+            if (!sawSetNotZero ||
+                cursor + 5 > wrapperEnd ||
+                (bytes[0] != 0xE8 &&
+                    bytes[0] != 0xE9))
+            {
+                continue;
+            }
+
+            const int32_t relative =
+                *reinterpret_cast<const int32_t*>(
+                    cursor + 1);
+            const uintptr_t candidate =
+                cursor + 5 + relative;
+            if (FindPlayerConsoleCommandIndex(
+                    candidate, controller,
+                    &resolvedIndex))
+            {
+                break;
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+
+    if (resolvedIndex == SIZE_MAX)
+    {
+        AtlasDiagnostics::WriteLine(
+            "console-return-path resolve-failed "
+            "wrapper=%p",
+            reinterpret_cast<void*>(nativeWrapper));
+        return false;
+    }
+
+    g_PlayerConsoleCommandIndex.store(
+        resolvedIndex, std::memory_order_release);
+    AtlasDiagnostics::WriteLine(
+        "console-return-path resolved index=%zu "
+        "target=%p",
+        resolvedIndex,
+        controller->Vft[resolvedIndex]);
+    return true;
+}
+
+static PlayerConsoleCommandNative ReadPlayerConsoleCommand(
+    UObject* controller,
+    size_t index)
+{
+    __try
+    {
+        return controller && controller->Vft
+            ? reinterpret_cast<PlayerConsoleCommandNative>(
+                controller->Vft[index])
+            : nullptr;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return nullptr;
+    }
+}
+
+static bool InvokePlayerConsoleCommand(
+    PlayerConsoleCommandNative native,
+    UObject* controller,
+    FString* output,
+    const FString* command)
+{
+    __try
+    {
+        native(controller, output, command, false);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+static bool FreeReturnedConsoleOutput(
+    FString* output)
+{
+    __try
+    {
+        output->Free();
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+static bool QueueReturnedConsoleOutput(
+    FString* output,
+    int length)
+{
+    __try
+    {
+        if (length > 0 &&
+            output->Data[length - 1] == L'\0')
+        {
+            length--;
+        }
+
+        if (length > 0)
+        {
+            GUI_QueueConsoleOutput(
+                output->Data, length);
+        }
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+static bool ExecuteConsoleCommandWithReturnedOutput(
+    UObject* controller,
+    const FString& command)
+{
+    // UE5's Kismet path can route CVars through IConsoleManager before it ever
+    // reaches PlayerController, so preserve Kismet dispatch there. UE4 routes
+    // this same call directly through PlayerController and can safely expose
+    // the otherwise-discarded FString response.
+    if (VersionInfo.EngineVersion >= 5.0 ||
+        !TryResolvePlayerConsoleCommand(controller))
+    {
+        return false;
+    }
+
+    const size_t index =
+        g_PlayerConsoleCommandIndex.load(
+            std::memory_order_acquire);
+    if (index == SIZE_MAX || index >= 768)
+        return false;
+
+    const PlayerConsoleCommandNative native =
+        ReadPlayerConsoleCommand(controller, index);
+    if (!IsExecutableAddress(
+            reinterpret_cast<void*>(native)))
+    {
+        return false;
+    }
+
+    FString output{};
+    if (!InvokePlayerConsoleCommand(
+            native, controller, &output, &command))
+    {
+        g_PlayerConsoleCommandIndex.store(
+            SIZE_MAX, std::memory_order_release);
+        AtlasDiagnostics::WriteLine(
+            "console-return-path invoke-failed target=%p",
+            reinterpret_cast<void*>(native));
+        QueueCommandError(
+            L"Command error: Unreal console dispatch failed.");
+        // The native call may already have performed part or all of the
+        // command before faulting. Treat it as consumed so the Kismet fallback
+        // cannot execute a state-changing command twice.
+        return true;
+    }
+
+    const bool emptyOutput =
+        !output.Data &&
+        output.NumElements == 0 &&
+        output.MaxElements == 0;
+    const bool allocatedOutput =
+        output.Data &&
+        output.NumElements >= 0 &&
+        output.MaxElements >= output.NumElements &&
+        output.MaxElements > 0 &&
+        output.MaxElements <= 65536 &&
+        IsReadableRange(
+            output.Data,
+            static_cast<size_t>(
+                (std::max)(output.NumElements, 1)) *
+                sizeof(wchar_t));
+    if (!emptyOutput && !allocatedOutput)
+    {
+        g_PlayerConsoleCommandIndex.store(
+            SIZE_MAX, std::memory_order_release);
+        AtlasDiagnostics::WriteLine(
+            "console-return-path invalid-result "
+            "data=%p num=%d max=%d",
+            output.Data,
+            output.NumElements,
+            output.MaxElements);
+        QueueCommandError(
+            L"Command ran, but Unreal returned invalid console output.");
+        return true;
+    }
+
+    if (allocatedOutput &&
+        output.NumElements > 0)
+    {
+        const int length =
+            (std::min)(output.NumElements, 16384);
+        if (!QueueReturnedConsoleOutput(
+                &output, length))
+        {
+            AtlasDiagnostics::WriteLine(
+                "console-return-path copy-failed "
+                "data=%p num=%d max=%d",
+                output.Data,
+                output.NumElements,
+                output.MaxElements);
+        }
+    }
+
+    if (allocatedOutput &&
+        !FreeReturnedConsoleOutput(&output))
+    {
+        AtlasDiagnostics::WriteLine(
+            "console-return-path free-failed");
+    }
+    return true;
+}
+
 static bool ExecNow(const char* cmd, bool showConsoleErrors = true)
 {
     if (!cmd || !*cmd)
@@ -907,10 +1926,26 @@ static bool ExecNow(const char* cmd, bool showConsoleErrors = true)
     }
     wide.resize(static_cast<size_t>(len - 1));
 
+    UObject* activeController =
+        localPlayers[0]->PlayerController;
     FString command(wide.c_str());
-    AtlasDiagnostics::WriteLine("command-dispatch pc=%p command=%s", localPlayers[0]->PlayerController, cmd);
-    UKismetSystemLibrary::ExecuteConsoleCommand(localPlayers[0]->PlayerController, command);
-    AtlasDiagnostics::WriteLine("command-return command=%s", cmd);
+    AtlasDiagnostics::WriteLine(
+        "command-dispatch world=%p pc=%p command=%s",
+        world, activeController, cmd);
+
+    const bool usedReturnedOutput =
+        ExecuteConsoleCommandWithReturnedOutput(
+            activeController, command);
+    if (!usedReturnedOutput)
+    {
+        UKismetSystemLibrary::ExecuteConsoleCommand(
+            world, command, activeController);
+    }
+
+    AtlasDiagnostics::WriteLine(
+        "command-return path=%s command=%s",
+        usedReturnedOutput ? "player-result" : "kismet",
+        cmd);
     command.Free();
     return true;
 }
@@ -929,9 +1964,31 @@ static std::mutex g_GameThreadCommandMutex;
 static std::deque<FGameThreadCommand> g_GameThreadCommands;
 static std::atomic_bool g_GameThreadDispatcherReady = false;
 static std::atomic_bool g_GameThreadCommandExecuting = false;
+static std::atomic_uint64_t g_GameplayMouseRestoreGeneration = 0;
+static std::atomic_uint64_t g_GameplayMouseRestoreHandledGeneration = 0;
+static std::atomic<HWND> g_GameplayMouseRestoreWindow = nullptr;
 static std::atomic<ULONGLONG> g_GameThreadCommandReadyAfter = 0;
 static constexpr size_t kMaximumGameThreadCommands = 1;
 static constexpr ULONGLONG kGameThreadCommandSettleMs = 100;
+
+void GUI_RequestGameplayMouseRestore(HWND gameWindow)
+{
+    if (!gameWindow)
+        return;
+
+    g_GameplayMouseRestoreWindow.store(
+        gameWindow, std::memory_order_release);
+    g_GameplayMouseRestoreGeneration.fetch_add(
+        1, std::memory_order_acq_rel);
+}
+
+void GUI_CancelGameplayMouseRestore()
+{
+    g_GameplayMouseRestoreHandledGeneration.store(
+        g_GameplayMouseRestoreGeneration.load(
+            std::memory_order_acquire),
+        std::memory_order_release);
+}
 
 void GUI_SetGameThreadDispatcherReady(bool ready)
 {
@@ -978,6 +2035,103 @@ static bool HandOffGameThreadCommand(
     return true;
 }
 
+static bool RestoreGameplayMouseNow()
+{
+    auto world = UWorld::GetWorld();
+    if (!world || !world->OwningGameInstance)
+        return false;
+
+    auto& localPlayers = world->OwningGameInstance->LocalPlayers;
+    if (localPlayers.Num() == 0 || !localPlayers[0] ||
+        !localPlayers[0]->PlayerController)
+    {
+        return false;
+    }
+
+    // Present detects the overlay transition, but reflected Unreal calls must
+    // stay on this game-thread pump. SetInputMode_GameOnly reapplies Slate's
+    // viewport focus, high-precision movement, capture, and lock policy.
+    static UObject* widgetLibrary = nullptr;
+    static UFunction* setInputModeGameOnly = nullptr;
+    static ULONGLONG nextResolveAttemptAt = 0;
+    if (!widgetLibrary || !setInputModeGameOnly)
+    {
+        const ULONGLONG now = GetTickCount64();
+        if (now < nextResolveAttemptAt)
+            return false;
+        nextResolveAttemptAt = now + 1000;
+
+        if (!widgetLibrary)
+        {
+            const UClass* widgetLibraryClass =
+                FindClass("WidgetBlueprintLibrary");
+            if (!widgetLibraryClass)
+                return false;
+
+            widgetLibrary = widgetLibraryClass->GetDefaultObj();
+        }
+
+        if (widgetLibrary)
+        {
+            setInputModeGameOnly =
+                widgetLibrary->GetFunction(
+                    "SetInputMode_GameOnly");
+        }
+    }
+    if (!widgetLibrary || !setInputModeGameOnly)
+        return false;
+
+    // UE5 adds bFlushInput after the player-controller parameter. The
+    // reflective caller ignores this extra argument on older one-parameter
+    // versions, keeping the restore compatible across supported builds.
+    widgetLibrary->Call<void>(
+        setInputModeGameOnly,
+        localPlayers[0]->PlayerController,
+        false);
+    return true;
+}
+
+static void PumpGameplayMouseRestore()
+{
+    const uint64_t mouseRestoreGeneration =
+        g_GameplayMouseRestoreGeneration.load(
+            std::memory_order_acquire);
+    const uint64_t handledMouseRestoreGeneration =
+        g_GameplayMouseRestoreHandledGeneration.load(
+            std::memory_order_acquire);
+    const HWND mouseRestoreWindow =
+        g_GameplayMouseRestoreWindow.load(
+            std::memory_order_acquire);
+    if (mouseRestoreGeneration !=
+            handledMouseRestoreGeneration &&
+        mouseRestoreWindow &&
+        GetForegroundWindow() == mouseRestoreWindow &&
+        !GUI_IsOverlayVisible() &&
+        RestoreGameplayMouseNow())
+    {
+        // Do not erase a newer close request that arrived while ProcessEvent
+        // was applying the input mode. Also leave this request pending if the
+        // overlay reopened or focus changed during that call.
+        if (GetForegroundWindow() == mouseRestoreWindow &&
+            !GUI_IsOverlayVisible())
+        {
+            uint64_t handledGeneration =
+                g_GameplayMouseRestoreHandledGeneration.load(
+                    std::memory_order_acquire);
+            while (handledGeneration <
+                    mouseRestoreGeneration &&
+                !g_GameplayMouseRestoreHandledGeneration
+                    .compare_exchange_weak(
+                        handledGeneration,
+                        mouseRestoreGeneration,
+                        std::memory_order_acq_rel,
+                        std::memory_order_acquire))
+            {
+            }
+        }
+    }
+}
+
 void GUI_PumpGameThreadCommands()
 {
     bool expected = false;
@@ -996,6 +2150,7 @@ void GUI_PumpGameThreadCommands()
         {
             g_GameThreadCommandExecuting.store(
                 false, std::memory_order_release);
+            PumpGameplayMouseRestore();
             return;
         }
 
@@ -1012,6 +2167,11 @@ void GUI_PumpGameThreadCommands()
         std::memory_order_release);
     g_GameThreadCommandExecuting.store(
         false, std::memory_order_release);
+
+    // A command such as ToggleDebugCamera can synchronously replace the local
+    // player's active controller. Resolve and restore input after dispatch so
+    // GameOnly mode is applied to the controller that now owns gameplay.
+    PumpGameplayMouseRestore();
 }
 
 static std::deque<std::string> g_CommandQueue;
@@ -1817,7 +2977,11 @@ void GUI_HandleInput(bool windowActive)
         {
             const unsigned int pressCount = TakePressCount(presses, command.VK);
             for (unsigned int i = 0; i < pressCount; i++)
-                Exec(command.Command.c_str());
+            {
+                if (Exec(command.Command.c_str()))
+                    AppendConsoleCommandEcho(
+                        command.Command);
+            }
         }
 
         for (const auto& macro : FGUI::Macros)
@@ -2070,8 +3234,7 @@ static bool SubmitConsoleCommand()
     }
 
     RememberConsoleCommand(raw);
-    std::string echo = "> " + raw;
-    AppendConsoleLine(EConsoleLineKind::Command, std::move(echo));
+    AppendConsoleCommandEcho(raw);
 
     g_ConsoleUi.Input.clear();
     g_ConsoleUi.Draft.clear();
@@ -2083,15 +3246,9 @@ static bool SubmitConsoleCommand()
     return true;
 }
 
-static ImVec4 ConsoleLineColor(EConsoleLineKind kind)
+static ImVec4 ConsoleLineColor(EConsoleLineKind)
 {
-    switch (kind)
-    {
-    case EConsoleLineKind::Command: return ImVec4(1.f, 1.f, 1.f, 1.f);
-    case EConsoleLineKind::System:  return ImVec4(0.70f, 0.70f, 0.72f, 1.f);
-    case EConsoleLineKind::Error:   return ImVec4(1.f, 0.39f, 0.43f, 1.f);
-    default:                        return Accent();
-    }
+    return ImVec4(1.f, 1.f, 1.f, 1.f);
 }
 
 static void DrawConsoleHistoryPopup(
@@ -2170,9 +3327,7 @@ static void DrawConsoleHistoryPopup(
         draw->AddText(
             ImVec2(popupMin.x + 7.f, rowTop + 2.f),
             ImGui::GetColorU32(
-                index == selected
-                    ? ImVec4(1.f, 1.f, 1.f, 1.f)
-                    : ImVec4(0.68f, 0.68f, 0.70f, 1.f)),
+                ImVec4(1.f, 1.f, 1.f, 1.f)),
             label.c_str());
     }
     draw->PopClipRect();
@@ -2181,8 +3336,12 @@ static void DrawConsoleHistoryPopup(
 static bool RenderConsoleCommandInput(
     float rightPadding, float frameOpacity)
 {
+    const float clearButtonWidth = 62.f;
+    const float controlSpacing = 6.f;
     ImGui::SetNextItemWidth((std::max)(
-        120.f, ImGui::GetContentRegionAvail().x - rightPadding));
+        120.f,
+        ImGui::GetContentRegionAvail().x -
+            rightPadding - clearButtonWidth - controlSpacing));
     if (g_ConsoleUi.FocusInput &&
         FGUI::bConsoleVisible.load(std::memory_order_acquire))
     {
@@ -2245,6 +3404,29 @@ static bool RenderConsoleCommandInput(
             ImVec4(1.f, 1.f, 1.f, 1.f)),
         ">");
     DrawConsoleHistoryPopup(inputMin, inputMax);
+
+    ImGui::SameLine(0.f, controlSpacing);
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.f);
+    ImGui::PushStyleColor(
+        ImGuiCol_Text, ImVec4(1.f, 1.f, 1.f, 1.f));
+    ImGui::PushStyleColor(
+        ImGuiCol_Button, ImVec4(0.f, 0.f, 0.f, frameAlpha));
+    ImGui::PushStyleColor(
+        ImGuiCol_ButtonHovered,
+        ImVec4(0.18f, 0.18f, 0.18f, frameAlpha));
+    ImGui::PushStyleColor(
+        ImGuiCol_ButtonActive,
+        ImVec4(0.27f, 0.27f, 0.27f, frameAlpha));
+    const bool clearLogs = ImGui::Button(
+        "Clear##console_logs",
+        ImVec2(clearButtonWidth, inputMax.y - inputMin.y));
+    ImGui::PopStyleColor(4);
+    ImGui::PopStyleVar();
+    if (clearLogs)
+    {
+        ClearConsoleLogs();
+        g_ConsoleUi.FocusInput = true;
+    }
 
     return submitted && SubmitConsoleCommand();
 }
@@ -2410,17 +3592,25 @@ static void RenderConsoleWindow(float fade)
                     const FConsoleLine& line =
                         g_ConsoleLines[static_cast<size_t>(row)];
                     ImGui::PushID(static_cast<int>(line.Id));
-                    ImGui::PushStyleColor(
-                        ImGuiCol_Text,
-                        ImVec4(0.46f, 0.46f, 0.48f, 1.f));
-                    ImGui::TextUnformatted(line.Time.c_str());
-                    ImGui::PopStyleColor();
-                    ImGui::SameLine();
-                    ImGui::PushStyleColor(
-                        ImGuiCol_Text,
-                        ConsoleLineColor(line.Kind));
-                    ImGui::TextUnformatted(line.Text.c_str());
-                    ImGui::PopStyleColor();
+                    if (line.Kind == EConsoleLineKind::Spacer)
+                    {
+                        ImGui::Dummy(ImVec2(
+                            0.f, ImGui::GetTextLineHeight()));
+                    }
+                    else
+                    {
+                        ImGui::PushStyleColor(
+                            ImGuiCol_Text,
+                            ImVec4(0.46f, 0.46f, 0.48f, 1.f));
+                        ImGui::TextUnformatted(line.Time.c_str());
+                        ImGui::PopStyleColor();
+                        ImGui::SameLine();
+                        ImGui::PushStyleColor(
+                            ImGuiCol_Text,
+                            ConsoleLineColor(line.Kind));
+                        ImGui::TextUnformatted(line.Text.c_str());
+                        ImGui::PopStyleColor();
+                    }
                     ImGui::PopID();
 
                     if (shouldScroll &&
@@ -2452,7 +3642,11 @@ static void RenderConsoleWindow(float fade)
 void GUI_Render()
 {
     ImGuiIO& io = ImGui::GetIO();
-    DrainConsoleOutput();
+    // Keep background ClientMessage capture bounded, but do not take the
+    // pending-output mutex on every Present while the console is hidden.
+    // Opening either console size drains everything collected since it closed.
+    if (FGUI::bConsoleVisible.load(std::memory_order_acquire))
+        DrainConsoleOutput();
 
     static float s_MenuFade = 0.f;
     static float s_ConsoleFade = 0.f;
@@ -2922,7 +4116,11 @@ void GUI_Render()
 
                 const float ButtonW = (CW - ImGui::GetStyle().ItemSpacing.x * 2.f) / 3.f;
                 if (ImGui::Button("Run", ImVec2(ButtonW, 0.f)))
-                    Exec(command.Command.c_str());
+                {
+                    if (Exec(command.Command.c_str()))
+                        AppendConsoleCommandEcho(
+                            command.Command);
+                }
                 ImGui::SameLine();
 
                 char bindLabel[64];
@@ -3125,11 +4323,6 @@ void GUI_Render()
         FGUI::ResetAll();
         CloseConsoleSurface();
     }
-
-    ImGui::Spacing();
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.353f, 0.388f, 0.478f, 1.f));
-    ImGui::TextWrapped("Console mode, hotkeys, command binds, and macros are saved automatically. Reset All restores the ATLAS console, F9 menu, F5 Join, and deletes saved commands and macros.");
-    ImGui::PopStyleColor();
 
         ImGui::Dummy(ImVec2(0.f, 8.f));
         break;
