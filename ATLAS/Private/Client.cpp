@@ -1,4 +1,5 @@
 #include "pch.h"
+#include "../Public/BuildingSMActor.h"
 #include "../Public/FortPlaylistAthena.h"
 #include "../Public/Utils.h"
 #include "../Public/FortPlayerControllerAthena.h"
@@ -345,12 +346,70 @@ void* SelectReset(void* a1)
 	return result;
 }
 
+static bool IsPlacedBuildingEditCandidate(AActor* candidate)
+{
+	return candidate &&
+		IsLiveUObject(candidate) &&
+		candidate->IsA<ABuildingSMActor>() &&
+		!candidate->IsA<ABuildingPlayerPrimitivePreview>();
+}
+
+static AActor* FindHighlightedPlacedBuilding(
+	AFortPlayerControllerAthena* playerController)
+{
+	if (playerController->HasHighlightedPrimaryBuilding())
+	{
+		auto highlighted =
+			playerController->HighlightedPrimaryBuilding.Get();
+		if (IsPlacedBuildingEditCandidate(highlighted))
+			return highlighted;
+	}
+
+	if (playerController->HasHighlightedPrimaryBuildings())
+	{
+		auto& highlighted =
+			playerController->HighlightedPrimaryBuildings;
+		for (int i = 0; i < highlighted.Num(); i++)
+		{
+			if (IsPlacedBuildingEditCandidate(highlighted[i]))
+				return highlighted[i];
+		}
+	}
+
+	return nullptr;
+}
+
 void PerformBuildingEditInteraction(AFortPlayerControllerAthena* _this)
 {
-	if (FConfiguration::bDisablePreEdits && _this && _this->TargetedBuilding && _this->TargetedBuilding->IsA<ABuildingPlayerPrimitivePreview>())
-		return;
+	if (FConfiguration::bDisablePreEdits.load(
+			std::memory_order_acquire) &&
+		_this && _this->HasTargetedBuilding())
+	{
+		auto target = _this->TargetedBuilding;
+		if (target &&
+			target->IsA<ABuildingPlayerPrimitivePreview>())
+		{
+			// TargetedBuilding can lag one update behind the highlight when
+			// switching away immediately after placement. Redirect that
+			// transient preview target to the real highlighted piece and let
+			// the original function enforce team/ownership permissions.
+			auto placedTarget =
+				FindHighlightedPlacedBuilding(_this);
+			if (!placedTarget)
+			{
+				AtlasDiagnostics::WriteLine(
+					"pre-edit blocked preview=%p", target);
+				return;
+			}
 
-	return PerformBuildingEditInteractionOG(_this);
+			_this->TargetedBuilding = placedTarget;
+			AtlasDiagnostics::WriteLine(
+				"pre-edit redirected preview=%p placed=%p",
+				target, placedTarget);
+		}
+	}
+
+	PerformBuildingEditInteractionOG(_this);
 }
 
 static std::atomic_bool g_ClientUObjectInitializationPending = true;
@@ -366,6 +425,33 @@ static std::atomic_bool g_ClientUObjectInitializationRunning = false;
 static ULONGLONG g_NextViewportConsoleAttemptAt = 0;
 static ULONGLONG g_NextPlaylistClassResolveAt = 0;
 static ULONGLONG g_NextPlaylistScanRetryAt = 0;
+
+static void ApplyLegacySprintByDefault(
+	AFortPlayerControllerAthena* playerController)
+{
+	if (VersionInfo.FortniteVersion >= 5.00 ||
+		!playerController ||
+		!playerController->HasbWantsToSprint())
+	{
+		return;
+	}
+
+	const bool enabled =
+		FConfiguration::bSprintByDefault.load(
+			std::memory_order_acquire);
+	static bool wasEnabled = false;
+
+	// bWantsToSprint is the pre-5.00 controller's local sprint intent.
+	// Reassert it while enabled because the normal input/reload/build paths
+	// are allowed to clear it. The game's own movement code still decides
+	// whether the pawn can sprint in its current state.
+	if (enabled)
+		playerController->bWantsToSprint = true;
+	else if (wasEnabled)
+		playerController->bWantsToSprint = false;
+
+	wasEnabled = enabled;
+}
 
 static void InitializePlaylistExtensions()
 {
@@ -656,6 +742,8 @@ static void ClientGameThreadTick()
 
 	if (playerController)
 	{
+		ApplyLegacySprintByDefault(playerController);
+
 		const ULONGLONG now = GetTickCount64();
 		if (g_ClientMessageCaptureEnabled.load(std::memory_order_acquire) &&
 			!g_ClientMessageCaptureInstalled.load(std::memory_order_acquire) &&
@@ -886,8 +974,10 @@ void Client::Init()
 		FConfiguration::bEOREnabled = true;
 	if (VersionInfo.FortniteVersion < 24.30)
 		FConfiguration::bROREnabled = true;
-	//if (VersionInfo.FortniteVersion < 15.20)
-		//FConfiguration::bDisablePreEdits = true;
+	if (VersionInfo.FortniteVersion < 15.20)
+		FConfiguration::bDisablePreEdits = true;
+	if (VersionInfo.FortniteVersion < 5.00)
+		FConfiguration::bSprintByDefault = true;
 
 	if (VersionInfo.FortniteVersion < 24.30)
 	{

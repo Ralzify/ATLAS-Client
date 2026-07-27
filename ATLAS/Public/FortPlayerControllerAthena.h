@@ -76,9 +76,12 @@ public:
 
     DEFINE_BITFIELD_PROP(bBuildFree);
     DEFINE_BITFIELD_PROP(bInfiniteAmmo);
+    DEFINE_BITFIELD_PROP(bWantsToSprint);
     DEFINE_PROP(CheatManager, UFortCheatManager*);
     DEFINE_PROP(CheatClass, TSubclassOf<UObject>);
     DEFINE_PROP(TargetedBuilding, AActor*);
+    DEFINE_PROP(HighlightedPrimaryBuilding, TWeakObjectPtr<AActor>);
+    DEFINE_PROP(HighlightedPrimaryBuildings, TArray<AActor*>);
     DEFINE_PROP(Pawn, AFortPlayerPawnAthena*);
     DEFINE_PROP(MyFortPawn, AFortPlayerPawnAthena*);
     DEFINE_PROP(PlayerState, AFortPlayerStateAthena*);

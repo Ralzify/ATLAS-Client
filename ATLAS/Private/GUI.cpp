@@ -3927,7 +3927,29 @@ void GUI_Render()
         }
 
         if (VersionInfo.FortniteVersion < 15.20)
-            ImGui::Checkbox("Disable Pre-Edits", &FConfiguration::bDisablePreEdits);
+        {
+            bool disablePreEdits =
+                FConfiguration::bDisablePreEdits.load(
+                    std::memory_order_acquire);
+            if (ImGui::Checkbox(
+                "Disable Pre-Edits", &disablePreEdits))
+            {
+                FConfiguration::bDisablePreEdits.store(
+                    disablePreEdits, std::memory_order_release);
+            }
+        }
+    }
+
+    if (VersionInfo.FortniteVersion < 5.00)
+    {
+        SectionLabel("Movement");
+        bool SprintByDefault = FConfiguration::bSprintByDefault.load(std::memory_order_acquire);
+
+        if (ImGui::Checkbox("Sprint by Default", &SprintByDefault))
+        {
+            FConfiguration::bSprintByDefault.store(SprintByDefault, std::memory_order_release);
+            AtlasDiagnostics::WriteLine("sprint-by-default changed=%s", SprintByDefault ? "enabled" : "disabled");
+        }
     }
 
     SectionLabel("FOV");
