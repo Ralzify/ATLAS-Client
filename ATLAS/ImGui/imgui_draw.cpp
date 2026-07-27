@@ -1723,6 +1723,12 @@ void ImDrawList::AddText(ImFont* font, float font_size, const ImVec2& pos, ImU32
         clip_rect.z = ImMin(clip_rect.z, cpu_fine_clip_rect->z);
         clip_rect.w = ImMin(clip_rect.w, cpu_fine_clip_rect->w);
     }
+    // Give all GUI text a subtle drop shadow while preserving the source
+    // alpha so fades and disabled labels continue to blend correctly.
+    const ImU32 text_alpha = (col & IM_COL32_A_MASK) >> IM_COL32_A_SHIFT;
+    const ImU32 shadow_alpha = (text_alpha * 140u) / 255u;
+    const ImU32 shadow_col = shadow_alpha << IM_COL32_A_SHIFT;
+    font->RenderText(this, font_size, pos + ImVec2(1.0f, 1.0f), shadow_col, clip_rect, text_begin, text_end, wrap_width, (cpu_fine_clip_rect != NULL) ? ImDrawTextFlags_CpuFineClip : ImDrawTextFlags_None);
     font->RenderText(this, font_size, pos, col, clip_rect, text_begin, text_end, wrap_width, (cpu_fine_clip_rect != NULL) ? ImDrawTextFlags_CpuFineClip : ImDrawTextFlags_None);
 }
 

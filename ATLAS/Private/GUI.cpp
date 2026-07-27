@@ -3765,7 +3765,7 @@ void GUI_Render()
         ImGui::SameLine(0.f, 6.f);
         ImGui::SetCursorPosY(TitleY);
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.353f, 0.388f, 0.478f, 1.f));
-        ImGui::Text("| Client");
+        ImGui::Text("Console");
         ImGui::PopStyleColor();
 
         ImGui::SameLine(0.f, 8.f);
