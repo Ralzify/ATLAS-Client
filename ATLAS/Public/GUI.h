@@ -29,7 +29,8 @@ struct FGUI
     static inline std::atomic_bool bVisible = false;
     static inline std::atomic_bool bConsoleVisible = false;
 
-    static inline std::atomic_int HotkeyVK = VK_F9;
+    static inline std::atomic_int HotkeyVK =
+        HotkeyPersist::DefaultMenuHotkeyVK;
     static inline bool bRebinding = false;
 
     static inline int ActiveTab = 0; // selected sidebar tab

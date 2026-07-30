@@ -10,6 +10,13 @@
 
 namespace HotkeyPersist
 {
+    static constexpr int DefaultMenuHotkeyVK = VK_F9;
+
+    inline int SanitizeRequiredMenuHotkey(int vk)
+    {
+        return (vk > 0 && vk <= 254) ? vk : DefaultMenuHotkeyVK;
+    }
+
     struct CommandBind
     {
         std::string Command;
@@ -450,6 +457,11 @@ namespace HotkeyPersist
         return content.find("\"consoleHotkey\"") != std::string::npos;
     }
 
+    inline bool HasValidSavedMenuHotkey()
+    {
+        return ParseKey(ReadFileContents(), "hotkey", 0) != 0;
+    }
+
     inline int LoadLegacyConsoleHotkey()
     {
         return ParseKey(ReadFileContents(), "consoleHotkey", 0);
@@ -459,6 +471,10 @@ namespace HotkeyPersist
         const std::vector<CommandBind>& commands,
         const std::vector<CommandMacro>& macros = {})
     {
+        // Opening ATLAS is a required action. Never persist it as unbound;
+        // invalid values are repaired to F9 instead.
+        hotkey = SanitizeRequiredMenuHotkey(hotkey);
+
         auto path = GetSettingsPath();
         std::ofstream f(path, std::ios::trunc);
 

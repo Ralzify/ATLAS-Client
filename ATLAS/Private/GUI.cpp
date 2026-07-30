@@ -437,8 +437,21 @@ static void RefreshExclusiveCommandHotkeys()
     }
 }
 
-void FGUI::SaveHotkey() { HotkeyPersist::Save(FGUI::HotkeyVK); }
-void FGUI::LoadHotkey() { FGUI::HotkeyVK = HotkeyPersist::Load(VK_F9); }
+void FGUI::SaveHotkey()
+{
+    const int hotkey = HotkeyPersist::SanitizeRequiredMenuHotkey(
+        FGUI::HotkeyVK.load(std::memory_order_acquire));
+    FGUI::HotkeyVK.store(hotkey, std::memory_order_release);
+    HotkeyPersist::Save(hotkey);
+}
+
+void FGUI::LoadHotkey()
+{
+    FGUI::HotkeyVK.store(
+        HotkeyPersist::SanitizeRequiredMenuHotkey(
+            HotkeyPersist::Load(HotkeyPersist::DefaultMenuHotkeyVK)),
+        std::memory_order_release);
+}
 
 void FGUI::SaveJoinHotkey() { HotkeyPersist::Save(FGUI::JoinHotkeyVK, "joinHotkey"); }
 void FGUI::LoadJoinHotkey() { FGUI::JoinHotkeyVK = HotkeyPersist::Load(VK_F5, "joinHotkey"); }
@@ -469,7 +482,7 @@ void FGUI::LoadMacros()
 
 void FGUI::ResetAll()
 {
-    FGUI::HotkeyVK = VK_F9;
+    FGUI::HotkeyVK = HotkeyPersist::DefaultMenuHotkeyVK;
     FGUI::JoinHotkeyVK = VK_F5;
     FConfiguration::ConsoleMode.store(
         static_cast<int>(EConsoleMode::Atlas), std::memory_order_release);
@@ -2448,6 +2461,8 @@ static void JoinSelectedHost()
 void GUI_Init()
 {
     AtlasDiagnostics::BeginSession(FConfiguration::ConsoleVersion);
+    const bool repairMenuHotkey =
+        !HotkeyPersist::HasValidSavedMenuHotkey();
     FGUI::LoadHotkey();
     FGUI::LoadJoinHotkey();
     FGUI::LoadCommands();
@@ -2462,7 +2477,8 @@ void GUI_Init()
         hadLegacyConsoleHotkey
             ? HotkeyPersist::LoadLegacyConsoleHotkey()
             : 0;
-    bool migratedSettings = hadLegacyConsoleHotkey;
+    bool migratedSettings =
+        hadLegacyConsoleHotkey || repairMenuHotkey;
     int menuHotkey = FGUI::HotkeyVK.load(std::memory_order_acquire);
     int joinHotkey = FGUI::JoinHotkeyVK.load(std::memory_order_acquire);
 
@@ -2545,6 +2561,12 @@ void GUI_Init()
         AtlasDiagnostics::WriteLine(
             "settings-migration unbound-console-conflicts=%zu",
             unboundActionCount);
+    }
+    if (repairMenuHotkey)
+    {
+        AtlasDiagnostics::WriteLine(
+            "settings-repair menu-hotkey=%d",
+            HotkeyPersist::DefaultMenuHotkeyVK);
     }
     PushStyle();
 }
@@ -3765,7 +3787,7 @@ void GUI_Render()
         ImGui::SameLine(0.f, 6.f);
         ImGui::SetCursorPosY(TitleY);
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.353f, 0.388f, 0.478f, 1.f));
-        ImGui::Text("Console");
+        ImGui::Text("| Console");
         ImGui::PopStyleColor();
 
         ImGui::SameLine(0.f, 8.f);

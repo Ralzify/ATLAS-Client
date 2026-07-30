@@ -11,7 +11,7 @@ enum class EConsoleMode : int
 
 struct FConfiguration
 {
-	static inline const char* ConsoleVersion = "v1.2.10";
+	static inline const char* ConsoleVersion = "v2.0.0";
 
 	static inline std::atomic_int ConsoleMode =
 		static_cast<int>(EConsoleMode::Atlas);
