@@ -111,6 +111,9 @@
     <ClInclude Include="ATLAS\Public\GUI.h">
       <Filter>ATLAS\Public</Filter>
     </ClInclude>
+    <ClInclude Include="ATLAS\Public\LoadoutTelemetry.h">
+      <Filter>ATLAS\Public</Filter>
+    </ClInclude>
     <ClInclude Include="ATLAS\ImGui\stb_image.h">
       <Filter>ATLAS\ImGui</Filter>
     </ClInclude>
@@ -156,6 +159,9 @@
       <Filter>ATLAS\ImGui</Filter>
     </ClCompile>
     <ClCompile Include="ATLAS\Private\GUI.cpp">
+      <Filter>ATLAS\Private</Filter>
+    </ClCompile>
+    <ClCompile Include="ATLAS\Private\LoadoutTelemetry.cpp">
       <Filter>ATLAS\Private</Filter>
     </ClCompile>
   </ItemGroup>

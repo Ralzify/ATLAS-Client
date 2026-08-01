@@ -40,6 +40,7 @@
     <ClInclude Include="ATLAS\Public\FortPlayerControllerAthena.h" />
     <ClInclude Include="ATLAS\Public\FortPlaylistAthena.h" />
     <ClInclude Include="ATLAS\Public\GUI.h" />
+    <ClInclude Include="ATLAS\Public\LoadoutTelemetry.h" />
     <ClInclude Include="ATLAS\Public\Hotkey.h" />
     <ClInclude Include="ATLAS\Public\Icon.h" />
     <ClInclude Include="ATLAS\Public\MinHook.h" />
@@ -66,6 +67,7 @@
     <ClCompile Include="ATLAS\Private\dllmain.cpp" />
     <ClCompile Include="ATLAS\Private\Finders.cpp" />
     <ClCompile Include="ATLAS\Private\GUI.cpp" />
+    <ClCompile Include="ATLAS\Private\LoadoutTelemetry.cpp" />
     <ClCompile Include="pch.cpp">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">Create</PrecompiledHeader>
     </ClCompile>

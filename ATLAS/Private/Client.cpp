@@ -7,6 +7,7 @@
 #include "../Public/Configuration.h"
 #include "../Public/Diagnostics.h"
 #include "../Public/GUI.h"
+#include "../Public/LoadoutTelemetry.h"
 
 #include <atomic>
 
@@ -119,13 +120,15 @@ static void CaptureClientMessage(UObject* context, FFrame& stack, void* result)
 	const bool shouldCapture =
 		FConfiguration::ConsoleMode.load(std::memory_order_acquire) ==
 			static_cast<int>(EConsoleMode::Atlas);
+	const bool shouldInspectTelemetry =
+		AtlasLoadoutTelemetry::WantsClientMessageHook();
 
 	const UFunction* function =
-		shouldCapture
+		(shouldCapture || shouldInspectTelemetry)
 			? g_ClientMessageFunction.load(std::memory_order_acquire)
 			: nullptr;
 	const uint32_t textOffset =
-		shouldCapture
+		(shouldCapture || shouldInspectTelemetry)
 			? g_ClientMessageTextOffset.load(std::memory_order_acquire)
 			: UINT32_MAX;
 	if (function && textOffset != UINT32_MAX && IsDirectClientMessageFrame(&stack, function))
@@ -142,7 +145,16 @@ static void CaptureClientMessage(UObject* context, FFrame& stack, void* result)
 			{
 				length--;
 			}
-			if (copied && length > 0)
+			// The bridge acknowledgement is private transport. Suppress only
+			// the exact, fixed-width marker for this process's current session;
+			// malformed, stale, and ordinary ClientMessage calls still flow to
+			// both the selected console and the game's original handler.
+			if (copied && AtlasLoadoutTelemetry::HandleClientMessage(
+				messageCopy, length))
+			{
+				return;
+			}
+			if (copied && shouldCapture && length > 0)
 			{
 				const bool serverCommandList =
 					LooksLikeServerCommandList(
@@ -164,7 +176,8 @@ static void CaptureClientMessage(UObject* context, FFrame& stack, void* result)
 
 static bool TryInstallClientMessageCapture(UObject* playerController)
 {
-	if (!g_ClientMessageCaptureEnabled.load(std::memory_order_acquire))
+	if (!g_ClientMessageCaptureEnabled.load(std::memory_order_acquire) &&
+		!AtlasLoadoutTelemetry::WantsClientMessageHook())
 		return true;
 
 	if (g_ClientMessageCaptureInstalled.load(std::memory_order_acquire) || !playerController)
@@ -740,18 +753,25 @@ static void ClientGameThreadTick()
 			world, playerController);
 	}
 
+	const ULONGLONG now = GetTickCount64();
+	if (playerController &&
+		(g_ClientMessageCaptureEnabled.load(std::memory_order_acquire) ||
+		 AtlasLoadoutTelemetry::WantsClientMessageHook()) &&
+		!g_ClientMessageCaptureInstalled.load(std::memory_order_acquire) &&
+		now >= nextCaptureResolveAt)
+	{
+		TryInstallClientMessageCapture(playerController);
+		nextCaptureResolveAt = now + 1000;
+	}
+
+	AtlasLoadoutTelemetry::GameThreadTick(
+		world,
+		playerController,
+		g_ClientMessageCaptureInstalled.load(std::memory_order_acquire));
+
 	if (playerController)
 	{
 		ApplyLegacySprintByDefault(playerController);
-
-		const ULONGLONG now = GetTickCount64();
-		if (g_ClientMessageCaptureEnabled.load(std::memory_order_acquire) &&
-			!g_ClientMessageCaptureInstalled.load(std::memory_order_acquire) &&
-			now >= nextCaptureResolveAt)
-		{
-			TryInstallClientMessageCapture(playerController);
-			nextCaptureResolveAt = now + 1000;
-		}
 
 		auto cheatManager = playerController->CheatManager;
 		if (playerController != observedController || cheatManager != observedManager)
@@ -1055,6 +1075,7 @@ void Client::Init()
 	const bool interactiveClient =
 		g_ClientMessageCaptureEnabled.load(
 			std::memory_order_acquire);
+	AtlasLoadoutTelemetry::SetEnabled(interactiveClient);
 	if (interactiveClient)
 	{
 		// Fail closed on an unsupported client build. Running UObject
