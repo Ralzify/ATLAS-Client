@@ -80,6 +80,7 @@ uint64 FindQueueStatEvent();
 uint64 FindFinishWorldInitialization();
 uint64 FindSetIsDoorOpen();
 uint64 FindActivatePhase();
+uint64 FindSpecialEventPhaseActivate();
 uint64 FindSelectAndSetupMyBuildingLevel();
 
 template <typename CVarT>

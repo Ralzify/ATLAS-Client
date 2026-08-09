@@ -1481,6 +1481,9 @@ void Main()
 
     SDK::Init();
 
+    if (fabs(VersionInfo.FortniteVersion - 27.11) < 0.001)
+        FConfiguration::bEnableIris = false;
+
     if (VersionInfo.EngineVersion >= 5.0)
     {
         auto RuntimeOptions = DefaultObjImpl("FortRuntimeOptions");

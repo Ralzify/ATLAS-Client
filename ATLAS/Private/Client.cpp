@@ -25,6 +25,24 @@ static std::atomic_bool g_ServerCommandListReceived = false;
 static std::atomic_uint64_t g_ConsoleSessionGeneration = 0;
 static std::atomic_uint32_t g_ClientMessageTextOffset = UINT32_MAX;
 
+using SpecialEventScriptActivateNative = void(*)(AActor*, int32, float);
+using SpecialEventPhaseActivateNative = void(*)(AActor*, float);
+static SpecialEventScriptActivateNative g_DurianScriptActivateOriginal = nullptr;
+static SpecialEventPhaseActivateNative g_DurianPhaseActivateOriginal = nullptr;
+static std::atomic_int g_DurianPendingPhaseIndex = -1;
+static std::atomic_int g_DurianObservedScriptPhaseIndex = -1;
+static std::atomic_int g_DurianSuppressedPhaseActorIndex = -1;
+static std::atomic<UWorld*> g_DurianPendingPhaseWorld = nullptr;
+static std::atomic_bool g_DurianPhaseSyncInstalled = false;
+static thread_local int g_DurianScriptActivationDepth = 0;
+static thread_local bool g_DurianSuppressPhaseActorActivation = false;
+static UWorld* g_DurianPhaseSyncWorld = nullptr;
+static int32 g_DurianLastAppliedPhaseIndex = -1;
+
+static void ProcessDurianPhaseSync(UWorld* world);
+static bool HandleDurianFinalPhaseCue(
+	const wchar_t* text, int textLength);
+
 struct FClientMessageView
 {
 	const wchar_t* Data;
@@ -122,13 +140,16 @@ static void CaptureClientMessage(UObject* context, FFrame& stack, void* result)
 			static_cast<int>(EConsoleMode::Atlas);
 	const bool shouldInspectTelemetry =
 		AtlasLoadoutTelemetry::WantsClientMessageHook();
+	const bool shouldInspectDurianCue =
+		fabs(VersionInfo.FortniteVersion - 27.11) < 0.001 &&
+		g_DurianPhaseSyncInstalled.load(std::memory_order_acquire);
 
 	const UFunction* function =
-		(shouldCapture || shouldInspectTelemetry)
+		(shouldCapture || shouldInspectTelemetry || shouldInspectDurianCue)
 			? g_ClientMessageFunction.load(std::memory_order_acquire)
 			: nullptr;
 	const uint32_t textOffset =
-		(shouldCapture || shouldInspectTelemetry)
+		(shouldCapture || shouldInspectTelemetry || shouldInspectDurianCue)
 			? g_ClientMessageTextOffset.load(std::memory_order_acquire)
 			: UINT32_MAX;
 	if (function && textOffset != UINT32_MAX && IsDirectClientMessageFrame(&stack, function))
@@ -145,10 +166,14 @@ static void CaptureClientMessage(UObject* context, FFrame& stack, void* result)
 			{
 				length--;
 			}
-			// The bridge acknowledgement is private transport. Suppress only
-			// the exact, fixed-width marker for this process's current session;
-			// malformed, stale, and ordinary ClientMessage calls still flow to
-			// both the selected console and the game's original handler.
+			if (copied && HandleDurianFinalPhaseCue(
+				messageCopy, length))
+			{
+				return;
+			}
+			// Bridge messages are private transport. Suppress only exact,
+			// fixed-width markers; malformed and ordinary ClientMessage calls
+			// still flow to the console and the game's original handler.
 			if (copied && AtlasLoadoutTelemetry::HandleClientMessage(
 				messageCopy, length))
 			{
@@ -265,6 +290,139 @@ static bool IsLiveUObject(const UObject* object)
 	{
 		return false;
 	}
+}
+
+static bool HandleDurianFinalPhaseCue(
+	const wchar_t* text, int textLength)
+{
+	static constexpr wchar_t cue[] = L"ATLAS_DURIAN_PHASE:5";
+	static constexpr int cueLength =
+		static_cast<int>(_countof(cue) - 1);
+	if (fabs(VersionInfo.FortniteVersion - 27.11) >= 0.001 ||
+		!g_DurianPhaseSyncInstalled.load(std::memory_order_acquire) ||
+		!text || textLength != cueLength ||
+		wmemcmp(text, cue, static_cast<size_t>(cueLength)) != 0)
+	{
+		return false;
+	}
+
+	auto world = UWorld::GetWorld();
+	if (world)
+	{
+		g_DurianPendingPhaseWorld.store(
+			world, std::memory_order_release);
+		g_DurianPendingPhaseIndex.store(
+			5, std::memory_order_release);
+		AtlasDiagnostics::WriteLine(
+			"durian-phase-sync early-cue phase=5 world=%p",
+			world);
+		ProcessDurianPhaseSync(world);
+	}
+	else
+	{
+		AtlasDiagnostics::WriteLine(
+			"durian-phase-sync early-cue ignored no-world");
+	}
+
+	return true;
+}
+
+static bool IsDurianSpecialEventScript(const AActor* script)
+{
+	if (!script || !script->Class)
+		return false;
+
+	const auto className = script->Class->Name.ToString();
+	return className == "BP_Durian_SpecialEventScript_C";
+}
+
+static int32 ResolveDurianPhaseIndex(const AActor* phaseActor)
+{
+	if (!phaseActor || !phaseActor->Class)
+		return -1;
+
+	const auto className = phaseActor->Class->Name.ToString();
+	static constexpr char prefix[] = "BP_Durian_Phase";
+	const size_t prefixPosition = className.find(prefix);
+	if (prefixPosition == decltype(className)::npos)
+		return -1;
+
+	const size_t numberPosition =
+		prefixPosition + sizeof(prefix) - 1;
+	if (numberPosition >= className.size())
+		return -1;
+
+	const int32 phaseNumber =
+		static_cast<int32>(className[numberPosition] - '0');
+	return phaseNumber >= 1 && phaseNumber <= 6
+		? phaseNumber - 1
+		: -1;
+}
+
+static void HookedDurianScriptActivate(
+	AActor* script,
+	int32 phaseIndex,
+	float sequenceTimeOffset)
+{
+	if (IsDurianSpecialEventScript(script))
+	{
+		g_DurianObservedScriptPhaseIndex.store(
+			phaseIndex, std::memory_order_release);
+	}
+
+	++g_DurianScriptActivationDepth;
+	if (g_DurianScriptActivateOriginal)
+	{
+		g_DurianScriptActivateOriginal(
+			script, phaseIndex, sequenceTimeOffset);
+	}
+	--g_DurianScriptActivationDepth;
+}
+
+static void HookedDurianPhaseActivate(
+	AActor* phaseActor,
+	float sequenceTimeOffset)
+{
+	const int32 phaseIndex = ResolveDurianPhaseIndex(phaseActor);
+	if (phaseIndex >= 0)
+	{
+		int32 suppressedPhase = phaseIndex;
+		if (g_DurianSuppressedPhaseActorIndex.compare_exchange_strong(
+				suppressedPhase, -1, std::memory_order_acq_rel))
+		{
+			AtlasDiagnostics::WriteLine(
+				"durian-phase-sync suppressed duplicate phase=%d actor=%p",
+				phaseIndex, phaseActor);
+			return;
+		}
+	}
+
+	if (g_DurianSuppressPhaseActorActivation)
+		return;
+
+	if (g_DurianPhaseActivateOriginal)
+	{
+		g_DurianPhaseActivateOriginal(
+			phaseActor, sequenceTimeOffset);
+	}
+
+	if (g_DurianScriptActivationDepth > 0)
+		return;
+
+	if (phaseIndex < 0 ||
+		g_DurianObservedScriptPhaseIndex.load(
+			std::memory_order_acquire) == phaseIndex)
+	{
+		return;
+	}
+
+	g_DurianPendingPhaseWorld.store(
+		UWorld::GetWorld(), std::memory_order_release);
+	g_DurianPendingPhaseIndex.store(
+		phaseIndex, std::memory_order_release);
+	AtlasDiagnostics::WriteLine(
+		"durian-phase-sync queued phase=%d actor=%p offset=%.3f",
+		phaseIndex, phaseActor, sequenceTimeOffset);
 }
 
 static void SafeCompleteBuildingEditInteraction()
@@ -713,6 +871,149 @@ static void InitializeClientUObjects()
 		false, std::memory_order_release);
 }
 
+static AActor* FindDurianSpecialEventScript()
+{
+	static const UClass* scriptClass = nullptr;
+	if (!IsLiveUObject(scriptClass))
+	{
+		scriptClass = static_cast<const UClass*>(StaticFindObject(
+			L"/Durian/Gameplay/BP_Durian_SpecialEventScript.BP_Durian_SpecialEventScript_C",
+			UClass::StaticClass()));
+	}
+	if (!IsLiveUObject(scriptClass))
+		return nullptr;
+
+	TArray<AActor*> scripts;
+	Utils::GetAll(scriptClass, scripts);
+	AActor* result = nullptr;
+	for (int32 index = 0; index < scripts.Num(); ++index)
+	{
+		AActor* script = scripts[index];
+		if (IsLiveUObject(script) &&
+			IsDurianSpecialEventScript(script))
+		{
+			result = script;
+			break;
+		}
+	}
+	scripts.Free();
+	return result;
+}
+
+static bool InvokeDurianPhaseOnRep(
+	AActor* script,
+	uint32 phaseOffset,
+	UFunction* onRep,
+	int32 phaseIndex,
+	int32* oldPhaseIndex)
+{
+	__try
+	{
+		auto phaseAddress = reinterpret_cast<int32*>(
+			reinterpret_cast<uint8*>(script) + phaseOffset);
+		*oldPhaseIndex = *phaseAddress;
+		*phaseAddress = phaseIndex;
+		g_DurianSuppressedPhaseActorIndex.store(
+			phaseIndex, std::memory_order_release);
+		g_DurianSuppressPhaseActorActivation = true;
+		script->ProcessEvent(onRep, nullptr);
+		g_DurianSuppressPhaseActorActivation = false;
+		return true;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		g_DurianSuppressPhaseActorActivation = false;
+		int32 suppressedPhase = phaseIndex;
+		g_DurianSuppressedPhaseActorIndex.compare_exchange_strong(
+			suppressedPhase, -1, std::memory_order_acq_rel);
+		return false;
+	}
+}
+
+static void ResetDurianPhaseSyncForWorld(UWorld* world)
+{
+	g_DurianPhaseSyncWorld = world;
+	g_DurianObservedScriptPhaseIndex.store(
+		-1, std::memory_order_release);
+	g_DurianSuppressedPhaseActorIndex.store(
+		-1, std::memory_order_release);
+	g_DurianLastAppliedPhaseIndex = -1;
+
+	if (g_DurianPendingPhaseWorld.load(
+			std::memory_order_acquire) != world)
+	{
+		g_DurianPendingPhaseIndex.store(
+			-1, std::memory_order_release);
+		g_DurianPendingPhaseWorld.store(
+			nullptr, std::memory_order_release);
+	}
+}
+
+static void ProcessDurianPhaseSync(UWorld* world)
+{
+	if (!g_DurianPhaseSyncInstalled.load(
+			std::memory_order_acquire) || !world)
+	{
+		return;
+	}
+
+	if (world != g_DurianPhaseSyncWorld)
+		ResetDurianPhaseSyncForWorld(world);
+
+	const int32 phaseIndex = g_DurianPendingPhaseIndex.load(
+		std::memory_order_acquire);
+	if (phaseIndex < 0)
+		return;
+
+	if (g_DurianPendingPhaseWorld.load(
+			std::memory_order_acquire) != world)
+	{
+		return;
+	}
+
+	if (phaseIndex == g_DurianLastAppliedPhaseIndex ||
+		phaseIndex == g_DurianObservedScriptPhaseIndex.load(
+			std::memory_order_acquire))
+	{
+		int32 expectedPhase = phaseIndex;
+		g_DurianPendingPhaseIndex.compare_exchange_strong(
+			expectedPhase, -1, std::memory_order_acq_rel);
+		return;
+	}
+
+	AActor* script = FindDurianSpecialEventScript();
+	if (!script)
+		return;
+
+	const uint32 phaseOffset = script->GetOffset(
+		"ReplicatedActivePhaseIndex");
+	UFunction* onRep = script->GetFunction(
+		"OnRep_ReplicatedActivePhaseIndex");
+	if (phaseOffset == UINT32_MAX || !IsLiveUObject(onRep))
+		return;
+
+	int32 oldPhaseIndex = -1;
+	if (!InvokeDurianPhaseOnRep(
+			script, phaseOffset, onRep,
+			phaseIndex, &oldPhaseIndex))
+	{
+		AtlasDiagnostics::WriteLine(
+			"durian-phase-sync apply-failed phase=%d script=%p",
+			phaseIndex, script);
+		return;
+	}
+
+	g_DurianObservedScriptPhaseIndex.store(
+		phaseIndex, std::memory_order_release);
+	g_DurianLastAppliedPhaseIndex = phaseIndex;
+	int32 expectedPhase = phaseIndex;
+	g_DurianPendingPhaseIndex.compare_exchange_strong(
+		expectedPhase, -1, std::memory_order_acq_rel);
+	AtlasDiagnostics::WriteLine(
+		"durian-phase-sync applied phase=%d old=%d script=%p",
+		phaseIndex, oldPhaseIndex, script);
+}
+
 static void ClientGameThreadTick()
 {
 	InitializeClientUObjects();
@@ -752,6 +1053,8 @@ static void ClientGameThreadTick()
 			static_cast<unsigned long long>(session),
 			world, playerController);
 	}
+
+	ProcessDurianPhaseSync(world);
 
 	const ULONGLONG now = GetTickCount64();
 	if (playerController &&
@@ -924,6 +1227,122 @@ static bool IsExecutableHookTarget(uint64 target)
 		(region.Protect & executableProtection) != 0;
 }
 
+static bool InstallDurianPhaseSyncHook()
+{
+	if (fabs(VersionInfo.FortniteVersion - 27.11) >= 0.001)
+		return true;
+
+	if (g_DurianPhaseSyncInstalled.load(
+			std::memory_order_acquire))
+	{
+		return true;
+	}
+
+	const MH_STATUS initializeStatus = MH_Initialize();
+	if (initializeStatus != MH_OK &&
+		initializeStatus != MH_ERROR_ALREADY_INITIALIZED)
+	{
+		AtlasDiagnostics::WriteLine(
+			"durian-phase-sync install-failed initialize-status=%d",
+			static_cast<int>(initializeStatus));
+		return false;
+	}
+
+	const uint64 scriptTarget = FindActivatePhase();
+	if (IsExecutableHookTarget(scriptTarget))
+	{
+		const MH_STATUS createStatus = MH_CreateHook(
+			reinterpret_cast<LPVOID>(scriptTarget),
+			reinterpret_cast<LPVOID>(HookedDurianScriptActivate),
+			reinterpret_cast<LPVOID*>(
+				&g_DurianScriptActivateOriginal));
+		if (createStatus == MH_OK &&
+			g_DurianScriptActivateOriginal)
+		{
+			const MH_STATUS enableStatus = MH_EnableHook(
+				reinterpret_cast<LPVOID>(scriptTarget));
+			if (enableStatus != MH_OK &&
+				enableStatus != MH_ERROR_ENABLED)
+			{
+				MH_RemoveHook(reinterpret_cast<LPVOID>(scriptTarget));
+				g_DurianScriptActivateOriginal = nullptr;
+				AtlasDiagnostics::WriteLine(
+					"durian-script-observer install-failed "
+					"enable-status=%d target=%p",
+					static_cast<int>(enableStatus),
+					reinterpret_cast<void*>(scriptTarget));
+			}
+			else
+			{
+				AtlasDiagnostics::WriteLine(
+					"durian-script-observer installed target=%p",
+					reinterpret_cast<void*>(scriptTarget));
+			}
+		}
+		else
+		{
+			g_DurianScriptActivateOriginal = nullptr;
+			AtlasDiagnostics::WriteLine(
+				"durian-script-observer install-failed "
+				"create-status=%d target=%p",
+				static_cast<int>(createStatus),
+				reinterpret_cast<void*>(scriptTarget));
+		}
+	}
+	else
+	{
+		AtlasDiagnostics::WriteLine(
+			"durian-script-observer unavailable target=%p",
+			reinterpret_cast<void*>(scriptTarget));
+	}
+
+	const uint64 phaseTarget = FindSpecialEventPhaseActivate();
+	if (!IsExecutableHookTarget(phaseTarget))
+	{
+		AtlasDiagnostics::WriteLine(
+			"durian-phase-sync install-failed invalid-target=%p",
+			reinterpret_cast<void*>(phaseTarget));
+		return false;
+	}
+
+	const MH_STATUS createStatus = MH_CreateHook(
+		reinterpret_cast<LPVOID>(phaseTarget),
+		reinterpret_cast<LPVOID>(HookedDurianPhaseActivate),
+		reinterpret_cast<LPVOID*>(&g_DurianPhaseActivateOriginal));
+	if (createStatus != MH_OK || !g_DurianPhaseActivateOriginal)
+	{
+		g_DurianPhaseActivateOriginal = nullptr;
+		AtlasDiagnostics::WriteLine(
+			"durian-phase-sync install-failed "
+			"create-status=%d target=%p",
+			static_cast<int>(createStatus),
+			reinterpret_cast<void*>(phaseTarget));
+		return false;
+	}
+
+	const MH_STATUS enableStatus = MH_EnableHook(
+		reinterpret_cast<LPVOID>(phaseTarget));
+	if (enableStatus != MH_OK &&
+		enableStatus != MH_ERROR_ENABLED)
+	{
+		MH_RemoveHook(reinterpret_cast<LPVOID>(phaseTarget));
+		g_DurianPhaseActivateOriginal = nullptr;
+		AtlasDiagnostics::WriteLine(
+			"durian-phase-sync install-failed "
+			"enable-status=%d target=%p",
+			static_cast<int>(enableStatus),
+			reinterpret_cast<void*>(phaseTarget));
+		return false;
+	}
+
+	g_DurianPhaseSyncInstalled.store(
+		true, std::memory_order_release);
+	AtlasDiagnostics::WriteLine(
+		"durian-phase-sync installed target=%p",
+		reinterpret_cast<void*>(phaseTarget));
+	return true;
+}
+
 static bool InstallGameThreadPump()
 {
 	if (g_GameThreadPumpInstalled.load(
@@ -1081,7 +1500,8 @@ void Client::Init()
 		// Fail closed on an unsupported client build. Running UObject
 		// initialization or cheat-manager maintenance from a Win32 worker
 		// recreates the world-travel/GC race this dispatcher removes.
-		InstallGameThreadPump();
+		if (InstallGameThreadPump())
+			InstallDurianPhaseSyncHook();
 	}
 	else
 	{
