@@ -26,6 +26,11 @@
 
 extern void* SelectEdit(void*);
 extern void* SelectReset(void*);
+extern bool ATLAS_PrepareReplicationForOpen(
+    const char* command,
+    bool remoteDurianLegacy,
+    wchar_t* error,
+    size_t errorCapacity);
 
 #define ACCENT_R 0.f
 #define ACCENT_G 0.635f
@@ -1903,6 +1908,21 @@ static bool ExecNow(const char* cmd, bool showConsoleErrors = true)
 {
     if (!cmd || !*cmd)
         return false;
+
+    wchar_t transportError[256]{};
+    if (!ATLAS_PrepareReplicationForOpen(
+            cmd,
+            FGUI::bRemoteDurianLegacyReplication.load(
+                std::memory_order_acquire),
+            transportError,
+            std::size(transportError)))
+    {
+        AtlasDiagnostics::WriteLine(
+            "command-skip replication-policy command=%s", cmd);
+        if (showConsoleErrors)
+            QueueCommandError(transportError);
+        return false;
+    }
 
     auto world = UWorld::GetWorld();
     if (!world || !world->OwningGameInstance)
@@ -3914,6 +3934,21 @@ void GUI_Render()
         ImGui::PushItemWidth(CW);
         ImGui::InputTextWithHint("##remoteip", "Enter IP to join", FGUI::RemoteIP, sizeof(FGUI::RemoteIP));
         ImGui::PopItemWidth();
+
+        if (std::fabs(VersionInfo.FortniteVersion - 27.11) < 0.001)
+        {
+            bool remoteDurianLegacy =
+                FGUI::bRemoteDurianLegacyReplication.load(
+                    std::memory_order_acquire);
+            if (ImGui::Checkbox(
+                    "Durian event (legacy replication)",
+                    &remoteDurianLegacy))
+            {
+                FGUI::bRemoteDurianLegacyReplication.store(
+                    remoteDurianLegacy,
+                    std::memory_order_release);
+            }
+        }
 
         ImGui::Spacing();
 

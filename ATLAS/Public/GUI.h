@@ -42,6 +42,7 @@ struct FGUI
 
     static inline int HostType = 0; // 0 = Local Host, 1 = Remote Host
     static inline char RemoteIP[64] = "";
+    static inline std::atomic_bool bRemoteDurianLegacyReplication = false;
 
     static inline std::atomic_int JoinHotkeyVK = VK_F5;
     static inline bool bRebindingJoin = false;

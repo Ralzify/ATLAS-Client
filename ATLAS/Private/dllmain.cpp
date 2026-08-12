@@ -67,6 +67,376 @@ static bool g_ShouldRestoreGameplayMouse = false;
 // but it must never consume or dispatch GUI input.
 static std::atomic_bool g_InteractiveInputEnabled = false;
 
+namespace
+{
+    constexpr wchar_t TransportMappingName[] =
+        L"Local\\Magnesium.Transport.v1";
+    constexpr DWORD TransportMagic = 0x4D475450u;
+    constexpr DWORD TransportSchema = 1u;
+    constexpr DWORD TransportCommitted = 1u;
+    constexpr DWORD TransportModeGenericLegacy = 0u;
+    constexpr DWORD TransportModeIris = 1u;
+
+    struct FTransportManifest
+    {
+        volatile LONG Sequence;
+        DWORD Magic;
+        DWORD Schema;
+        DWORD StructSize;
+        DWORD PublisherPid;
+        DWORD FortniteVersionHundredths;
+        DWORD ServerPort;
+        DWORD Committed;
+        DWORD Mode;
+    };
+
+    static_assert(sizeof(FTransportManifest) == 36);
+    static_assert(offsetof(FTransportManifest, Sequence) == 0);
+    static_assert(offsetof(FTransportManifest, Magic) == 4);
+    static_assert(offsetof(FTransportManifest, Mode) == 32);
+
+    struct FIrisPatchSite
+    {
+        uintptr_t DisplacementAddress = 0;
+        uint32_t OriginalDisplacement = 0;
+    };
+
+    std::mutex IrisPolicyMutex;
+    std::vector<FIrisPatchSite> IrisPatchSites;
+    uint32_t* IrisCVar = nullptr;
+    bool bIrisPatchSitesCaptured = false;
+    bool bHeadlessHostProcess = false;
+
+    DWORD GetFortniteVersionHundredths()
+    {
+        return static_cast<DWORD>(
+            VersionInfo.FortniteVersion * 100.0 + 0.5);
+    }
+
+    bool CaptureIrisPatchSites(uintptr_t IrisBool)
+    {
+        if (bIrisPatchSitesCaptured)
+            return !IrisPatchSites.empty();
+        if (!IrisBool)
+            return false;
+
+        const auto SizeOfImage =
+            Memcury::PE::GetNTHeaders()->OptionalHeader.SizeOfImage;
+        const auto ScanBytes = reinterpret_cast<std::uint8_t*>(
+            Memcury::PE::GetModuleBase());
+        if (!ScanBytes || SizeOfImage < 7)
+            return false;
+
+        for (size_t Index = 0; Index + 7 <= SizeOfImage; ++Index)
+        {
+            const bool bCmpImmediate = ScanBytes[Index] == 0x83;
+            const bool bCmpRegister = ScanBytes[Index] == 0x39;
+            if (!bCmpImmediate && !bCmpRegister)
+                continue;
+
+            const auto Target = Memcury::PE::Address(&ScanBytes[Index])
+                .RelativeOffset(2, bCmpImmediate ? 1u : 0u)
+                .GetAs<void*>();
+            if (Target != reinterpret_cast<void*>(IrisBool))
+                continue;
+
+            const auto DisplacementAddress = reinterpret_cast<uintptr_t>(
+                &ScanBytes[Index + 2]);
+            const auto Existing = std::find_if(
+                IrisPatchSites.begin(),
+                IrisPatchSites.end(),
+                [DisplacementAddress](const FIrisPatchSite& Site)
+                {
+                    return Site.DisplacementAddress == DisplacementAddress;
+                });
+            if (Existing == IrisPatchSites.end())
+            {
+                IrisPatchSites.push_back({
+                    DisplacementAddress,
+                    *reinterpret_cast<uint32_t*>(DisplacementAddress)
+                });
+            }
+        }
+
+        bIrisPatchSitesCaptured = true;
+        AtlasDiagnostics::WriteLine(
+            "replication-policy iris-sites=%zu cvar=%p",
+            IrisPatchSites.size(),
+            reinterpret_cast<void*>(IrisBool));
+        return !IrisPatchSites.empty();
+    }
+
+    bool ApplyIrisPolicyLocked(bool bUseIris)
+    {
+        if (bHeadlessHostProcess || VersionInfo.EngineVersion < 5.3)
+            return VersionInfo.EngineVersion < 5.3;
+
+        if (!IrisCVar)
+            IrisCVar = FindCVar<uint32_t>(
+                L"net.Iris.UseIrisReplication");
+        if (!IrisCVar)
+        {
+            AtlasDiagnostics::WriteLine(
+                "replication-policy failed mode=%s cvar=%p sites=%zu",
+                bUseIris ? "Iris" : "GenericLegacy",
+                static_cast<void*>(IrisCVar),
+                IrisPatchSites.size());
+            return false;
+        }
+
+        // Some UE5 cohorts honor the cvar directly and contain no forceable
+        // compare sites. Preserve that supported path; on 27.11 the captured
+        // sites are additionally restored for Generic or forced for Iris.
+        CaptureIrisPatchSites(
+            reinterpret_cast<uintptr_t>(IrisCVar));
+
+        if (bUseIris)
+        {
+            *IrisCVar = 1u;
+            for (const auto& Site : IrisPatchSites)
+                Utils::Patch<uint32_t>(
+                    Site.DisplacementAddress, 0u);
+        }
+        else
+        {
+            for (const auto& Site : IrisPatchSites)
+            {
+                Utils::Patch<uint32_t>(
+                    Site.DisplacementAddress,
+                    Site.OriginalDisplacement);
+            }
+            *IrisCVar = 0u;
+        }
+
+        FlushInstructionCache(
+            GetCurrentProcess(), nullptr, 0);
+        FConfiguration::bEnableIris = bUseIris;
+        AtlasDiagnostics::WriteLine(
+            "replication-policy applied mode=%s sites=%zu",
+            bUseIris ? "Iris" : "GenericLegacy",
+            IrisPatchSites.size());
+        return true;
+    }
+
+    bool IsPublisherAlive(DWORD PublisherPid)
+    {
+        if (!PublisherPid || PublisherPid == GetCurrentProcessId())
+            return false;
+
+        HANDLE Process = OpenProcess(
+            SYNCHRONIZE, FALSE, PublisherPid);
+        if (!Process)
+            return false;
+        const DWORD WaitResult = WaitForSingleObject(Process, 0);
+        CloseHandle(Process);
+        return WaitResult == WAIT_TIMEOUT;
+    }
+
+    bool ReadLocalTransportManifest(
+        DWORD ExpectedPort,
+        bool& bOutUseIris,
+        wchar_t* Error,
+        size_t ErrorCapacity)
+    {
+        HANDLE Mapping = OpenFileMappingW(
+            FILE_MAP_READ, FALSE, TransportMappingName);
+        if (!Mapping)
+        {
+            _snwprintf_s(
+                Error, ErrorCapacity, _TRUNCATE,
+                L"Local server transport is not ready. Start the Magnesium match before joining.");
+            return false;
+        }
+
+        auto Shared = static_cast<const FTransportManifest*>(
+            MapViewOfFile(
+                Mapping, FILE_MAP_READ, 0, 0,
+                sizeof(FTransportManifest)));
+        if (!Shared)
+        {
+            CloseHandle(Mapping);
+            _snwprintf_s(
+                Error, ErrorCapacity, _TRUNCATE,
+                L"Could not read the local server transport policy.");
+            return false;
+        }
+
+        FTransportManifest Snapshot{};
+        bool bStable = false;
+        for (int Attempt = 0; Attempt < 8; ++Attempt)
+        {
+            const LONG SequenceBefore = Shared->Sequence;
+            if (!SequenceBefore || (SequenceBefore & 1))
+            {
+                SwitchToThread();
+                continue;
+            }
+
+            Snapshot.Magic = Shared->Magic;
+            Snapshot.Schema = Shared->Schema;
+            Snapshot.StructSize = Shared->StructSize;
+            Snapshot.PublisherPid = Shared->PublisherPid;
+            Snapshot.FortniteVersionHundredths =
+                Shared->FortniteVersionHundredths;
+            Snapshot.ServerPort = Shared->ServerPort;
+            Snapshot.Committed = Shared->Committed;
+            Snapshot.Mode = Shared->Mode;
+            MemoryBarrier();
+
+            const LONG SequenceAfter = Shared->Sequence;
+            if (SequenceBefore == SequenceAfter &&
+                !(SequenceAfter & 1))
+            {
+                Snapshot.Sequence = SequenceAfter;
+                bStable = true;
+                break;
+            }
+        }
+
+        UnmapViewOfFile(Shared);
+        CloseHandle(Mapping);
+
+        const bool bValid = bStable &&
+            Snapshot.Magic == TransportMagic &&
+            Snapshot.Schema == TransportSchema &&
+            Snapshot.StructSize == sizeof(FTransportManifest) &&
+            Snapshot.FortniteVersionHundredths == 2711u &&
+            Snapshot.Committed == TransportCommitted &&
+            (Snapshot.Mode == TransportModeGenericLegacy ||
+                Snapshot.Mode == TransportModeIris) &&
+            IsPublisherAlive(Snapshot.PublisherPid);
+        if (!bValid)
+        {
+            _snwprintf_s(
+                Error, ErrorCapacity, _TRUNCATE,
+                L"The local server transport policy is invalid or stale. Restart the Magnesium host.");
+            return false;
+        }
+
+        if (ExpectedPort != Snapshot.ServerPort)
+        {
+            _snwprintf_s(
+                Error, ErrorCapacity, _TRUNCATE,
+                L"The local server is using port %lu. Join 127.0.0.1:%lu instead.",
+                Snapshot.ServerPort,
+                Snapshot.ServerPort);
+            return false;
+        }
+
+        bOutUseIris = Snapshot.Mode == TransportModeIris;
+        AtlasDiagnostics::WriteLine(
+            "replication-policy manifest pid=%lu version=%lu port=%lu mode=%s",
+            Snapshot.PublisherPid,
+            Snapshot.FortniteVersionHundredths,
+            Snapshot.ServerPort,
+            bOutUseIris ? "Iris" : "GenericLegacy");
+        return true;
+    }
+
+    bool IsOpenCommand(
+        const char* Command,
+        bool& bOutLoopback,
+        DWORD& OutPort)
+    {
+        bOutLoopback = false;
+        OutPort = 7777u;
+        if (!Command)
+            return false;
+
+        while (*Command && std::isspace(
+            static_cast<unsigned char>(*Command)))
+        {
+            ++Command;
+        }
+        if (_strnicmp(Command, "open", 4) != 0 ||
+            !std::isspace(static_cast<unsigned char>(Command[4])))
+        {
+            return false;
+        }
+
+        Command += 4;
+        while (*Command && std::isspace(
+            static_cast<unsigned char>(*Command)))
+        {
+            ++Command;
+        }
+        if (!*Command)
+            return false;
+
+        const char* End = Command;
+        while (*End && !std::isspace(
+            static_cast<unsigned char>(*End)) && *End != '?')
+        {
+            ++End;
+        }
+        std::string Endpoint(Command, End);
+        if (Endpoint.empty())
+            return false;
+
+        std::string Host = Endpoint;
+        const auto Colon = Endpoint.rfind(':');
+        if (Colon != std::string::npos &&
+            Endpoint.find(':') == Colon)
+        {
+            const std::string PortText = Endpoint.substr(Colon + 1);
+            char* ParseEnd = nullptr;
+            const unsigned long ParsedPort = std::strtoul(
+                PortText.c_str(), &ParseEnd, 10);
+            if (ParseEnd && *ParseEnd == '\0' &&
+                ParsedPort > 0 && ParsedPort <= 65535)
+            {
+                OutPort = static_cast<DWORD>(ParsedPort);
+                Host.resize(Colon);
+            }
+        }
+
+        bOutLoopback = _stricmp(Host.c_str(), "127.0.0.1") == 0 ||
+            _stricmp(Host.c_str(), "localhost") == 0 ||
+            Host == "[::1]" || Host == "::1";
+        return true;
+    }
+}
+
+bool ATLAS_PrepareReplicationForOpen(
+    const char* Command,
+    bool bRemoteDurianLegacy,
+    wchar_t* Error,
+    size_t ErrorCapacity)
+{
+    bool bLoopback = false;
+    DWORD Port = 7777u;
+    if (!IsOpenCommand(Command, bLoopback, Port))
+        return true;
+    if (VersionInfo.EngineVersion < 5.3)
+        return true;
+
+    bool bUseIris = FConfiguration::bEnableIris;
+    if (GetFortniteVersionHundredths() == 2711u)
+    {
+        if (bLoopback)
+        {
+            if (!ReadLocalTransportManifest(
+                    Port, bUseIris, Error, ErrorCapacity))
+            {
+                return false;
+            }
+        }
+        else
+        {
+            bUseIris = !bRemoteDurianLegacy;
+        }
+    }
+
+    std::lock_guard<std::mutex> Lock(IrisPolicyMutex);
+    if (ApplyIrisPolicyLocked(bUseIris))
+        return true;
+
+    _snwprintf_s(
+        Error, ErrorCapacity, _TRUNCATE,
+        L"Could not configure the client replication transport. Restart ATLAS and try again.");
+    return false;
+}
+
 static UINT GetReleaseMouseCaptureMessage()
 {
     static const UINT message =
@@ -1439,20 +1809,6 @@ static void InstallDXHookThread()
         Sleep(250);
 }
 
-void ForceIris(uintptr_t IrisBool)
-{
-    const auto sizeOfImage = Memcury::PE::GetNTHeaders()->OptionalHeader.SizeOfImage;
-    const auto scanBytes = reinterpret_cast<std::uint8_t*>(Memcury::PE::GetModuleBase());
-    for (auto i = 0ul; i < sizeOfImage - 5; ++i)
-    {
-        if (scanBytes[i] == 0x83 || scanBytes[i] == 0x39)
-        {
-            if (Memcury::PE::Address(&scanBytes[i]).RelativeOffset(2, scanBytes[i] == 0x83).GetAs<void*>() == (void*)IrisBool)
-                Utils::Patch<uint32_t>(__int64(&scanBytes[i]) + 2, 0x0);
-        }
-    }
-}
-
 void Main()
 {
     // ATLAS owns detached client/render threads and live hooks. Pinning keeps
@@ -1466,6 +1822,7 @@ void Main()
 
     const wchar_t* commandLine = GetCommandLineW();
     const bool headlessHost = ContainsInsensitive(commandLine, L"-nullrhi");
+    bHeadlessHostProcess = headlessHost;
     g_InteractiveInputEnabled.store(!headlessHost, std::memory_order_release);
     Client::SetConsoleCaptureEnabled(!headlessHost);
     const int consoleMode = HotkeyPersist::LoadConsoleMode();
@@ -1480,9 +1837,6 @@ void Main()
     std::thread(InstallDXHookThread).detach();
 
     SDK::Init();
-
-    if (fabs(VersionInfo.FortniteVersion - 27.11) < 0.001)
-        FConfiguration::bEnableIris = false;
 
     if (VersionInfo.EngineVersion >= 5.0)
     {
@@ -1502,18 +1856,27 @@ void Main()
     if (VersionInfo.EngineVersion >= 5.1)
         UKismetSystemLibrary::ExecuteConsoleCommand(UWorld::GetWorld(), FString(L"net.AllowEncryption 0"), nullptr);
 
-    if (VersionInfo.EngineVersion >= 5.3 && FConfiguration::bEnableIris)
+    if (!headlessHost &&
+        VersionInfo.EngineVersion >= 5.3 &&
+        FConfiguration::bEnableIris)
     {
         UKismetSystemLibrary::ExecuteConsoleCommand(UWorld::GetWorld(), FString(L"log LogIris None"), nullptr);
         UKismetSystemLibrary::ExecuteConsoleCommand(UWorld::GetWorld(), FString(L"log LogIrisRpc None"), nullptr);
         UKismetSystemLibrary::ExecuteConsoleCommand(UWorld::GetWorld(), FString(L"log LogIrisBridge None"), nullptr);
 
-        auto IrisBool = FindCVar<uint32_t>(L"net.Iris.UseIrisReplication");
-
-        if (IrisBool) 
-            *IrisBool = true;
-
-        ForceIris(__int64(IrisBool));
+        std::lock_guard<std::mutex> Lock(IrisPolicyMutex);
+        IrisCVar = FindCVar<uint32_t>(
+            L"net.Iris.UseIrisReplication");
+        if (IrisCVar)
+        {
+            CaptureIrisPatchSites(
+                reinterpret_cast<uintptr_t>(IrisCVar));
+        }
+        else
+        {
+            AtlasDiagnostics::WriteLine(
+                "replication-policy prepare-failed cvar=null");
+        }
     }
 
     if (VersionInfo.EngineVersion >= 5.4)
