@@ -4034,6 +4034,10 @@ void GUI_Render()
     SectionLabel("Respawn");
     ImGui::Checkbox("Respawns Enabled", &FConfiguration::bForceRespawns);
 
+	ImGui::Spacing();
+
+	ImGui::TextUnformatted("Credit: Plooshi - Erbium Console | Base of the project.");
+
         break;
     }
     case 1: // Commands
