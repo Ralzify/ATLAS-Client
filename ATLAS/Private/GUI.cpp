@@ -4996,6 +4996,10 @@ void GUI_Render()
         SettingCommandTargetInfo);
     EndSectionBody();
 
+	ImGui::Spacing();
+
+	ImGui::TextUnformatted("Credit: Plooshi - Erbium Console | Base of the project.");
+
         break;
     }
     case 1: // Commands
