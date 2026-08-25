@@ -7,6 +7,7 @@
 #include <sstream>
 #include <vector>
 #include <cctype>
+#include <mutex>
 
 namespace HotkeyPersist
 {
@@ -40,6 +41,25 @@ namespace HotkeyPersist
         std::vector<MacroStep> Steps;
     };
 
+    struct UserPreferences
+    {
+        bool SaveTogglePreferences = true;
+        bool SlashKey = true;
+        bool EditOnRelease = true;
+        bool ResetOnRelease = true;
+        bool DisablePreEdits = true;
+        bool MobileBuilds = false;
+        bool InGameFog = true;
+        bool SprintByDefault = true;
+        bool RespawnsEnabled = true;
+    };
+
+    inline std::recursive_mutex& GetSettingsMutex()
+    {
+        static std::recursive_mutex mutex;
+        return mutex;
+    }
+
     static constexpr int MinMacroDelayMs = 100;
     static constexpr int MaxMacroDelayMs = 60000;
 
@@ -66,6 +86,8 @@ namespace HotkeyPersist
 
     inline std::string ReadFileContents()
     {
+        std::lock_guard<std::recursive_mutex> lock(
+            GetSettingsMutex());
         auto path = GetSettingsPath();
         std::ifstream f(path);
 
@@ -308,6 +330,149 @@ namespace HotkeyPersist
         return std::string::npos;
     }
 
+    inline size_t FindJsonField(
+        const std::string& content,
+        const char* key)
+    {
+        const std::string needle =
+            std::string("\"") + key + "\"";
+        bool inString = false;
+        bool escaped = false;
+        for (size_t i = 0; i < content.size(); i++)
+        {
+            const char ch = content[i];
+            if (escaped)
+            {
+                escaped = false;
+                continue;
+            }
+            if (inString && ch == '\\')
+            {
+                escaped = true;
+                continue;
+            }
+            if (!inString &&
+                content.compare(i, needle.size(), needle) == 0)
+            {
+                size_t after = i + needle.size();
+                while (after < content.size() &&
+                    std::isspace(static_cast<unsigned char>(
+                        content[after])))
+                {
+                    after++;
+                }
+                if (after < content.size() &&
+                    content[after] == ':')
+                {
+                    return i;
+                }
+            }
+            if (ch == '"')
+                inString = !inString;
+        }
+
+        return std::string::npos;
+    }
+
+    inline std::string ExtractPreferencesObject(
+        const std::string& content)
+    {
+        const auto key = FindJsonField(
+            content, "preferences");
+        if (key == std::string::npos)
+            return std::string();
+
+        auto value = content.find(':', key);
+        if (value == std::string::npos)
+            return std::string();
+
+        value++;
+        while (value < content.size() &&
+            std::isspace(static_cast<unsigned char>(
+                content[value])))
+        {
+            value++;
+        }
+        if (value >= content.size() || content[value] != '{')
+            return std::string();
+
+        const auto objectEnd = FindObjectEnd(content, value);
+        if (objectEnd == std::string::npos)
+            return std::string();
+
+        return content.substr(
+            value, objectEnd - value + 1);
+    }
+
+    inline bool ParseBoolField(
+        const std::string& content,
+        const char* key,
+        bool defaultValue)
+    {
+        const std::string needle =
+            std::string("\"") + key + "\"";
+        auto pos = content.find(needle);
+        if (pos == std::string::npos)
+            return defaultValue;
+
+        pos = content.find(':', pos + needle.size());
+        if (pos == std::string::npos)
+            return defaultValue;
+
+        pos++;
+        while (pos < content.size() &&
+            std::isspace(
+                static_cast<unsigned char>(content[pos])))
+        {
+            pos++;
+        }
+
+        if (content.compare(pos, 4, "true") == 0 ||
+            (pos < content.size() && content[pos] == '1'))
+        {
+            return true;
+        }
+        if (content.compare(pos, 5, "false") == 0 ||
+            (pos < content.size() && content[pos] == '0'))
+        {
+            return false;
+        }
+
+        return defaultValue;
+    }
+
+    inline UserPreferences ParseUserPreferences(
+        const std::string& content,
+        const UserPreferences& defaults = UserPreferences{})
+    {
+        UserPreferences preferences = defaults;
+        const std::string object =
+            ExtractPreferencesObject(content);
+        if (object.empty())
+            return preferences;
+
+        preferences.SaveTogglePreferences = ParseBoolField(
+            object, "saveTogglePreferences",
+            preferences.SaveTogglePreferences);
+        preferences.SlashKey = ParseBoolField(
+            object, "slashKey", preferences.SlashKey);
+        preferences.EditOnRelease = ParseBoolField(
+            object, "editOnRelease", preferences.EditOnRelease);
+        preferences.ResetOnRelease = ParseBoolField(
+            object, "resetOnRelease", preferences.ResetOnRelease);
+        preferences.DisablePreEdits = ParseBoolField(
+            object, "disablePreEdits", preferences.DisablePreEdits);
+        preferences.MobileBuilds = ParseBoolField(
+            object, "mobileBuilds", preferences.MobileBuilds);
+        preferences.InGameFog = ParseBoolField(
+            object, "inGameFog", preferences.InGameFog);
+        preferences.SprintByDefault = ParseBoolField(
+            object, "sprintByDefault", preferences.SprintByDefault);
+        preferences.RespawnsEnabled = ParseBoolField(
+            object, "respawnsEnabled", preferences.RespawnsEnabled);
+        return preferences;
+    }
+
     inline std::vector<CommandBind> ParseCommands(const std::string& content)
     {
         std::vector<CommandBind> commands;
@@ -469,11 +634,24 @@ namespace HotkeyPersist
 
     inline void SaveAll(int hotkey, int joinHotkey, int consoleMode,
         const std::vector<CommandBind>& commands,
-        const std::vector<CommandMacro>& macros = {})
+        const std::vector<CommandMacro>& macros = {},
+        const UserPreferences* preferences = nullptr)
     {
+        std::lock_guard<std::recursive_mutex> lock(
+            GetSettingsMutex());
+
         // Opening ATLAS is a required action. Never persist it as unbound;
         // invalid values are repaired to F9 instead.
         hotkey = SanitizeRequiredMenuHotkey(hotkey);
+
+        // Most save paths update only one part of console.json. Preserve the
+        // existing preferences object byte-for-byte unless the caller is
+        // explicitly saving a new preference snapshot.
+        const std::string existingContent = ReadFileContents();
+        const std::string existingPreferences =
+            ExtractPreferencesObject(existingContent);
+        const bool writePreferences =
+            preferences != nullptr || !existingPreferences.empty();
 
         auto path = GetSettingsPath();
         std::ofstream f(path, std::ios::trunc);
@@ -485,6 +663,33 @@ namespace HotkeyPersist
         f << "  \"hotkey\": " << hotkey << ",\n";
         f << "  \"joinHotkey\": " << joinHotkey << ",\n";
         f << "  \"consoleMode\": " << SanitizeConsoleMode(consoleMode) << ",\n";
+        if (writePreferences)
+        {
+            f << "  \"preferences\": ";
+            if (!preferences)
+            {
+                f << existingPreferences;
+            }
+            else
+            {
+                const auto boolean = [](bool value)
+                {
+                    return value ? "true" : "false";
+                };
+                f << "{\n";
+                f << "    \"saveTogglePreferences\": " << boolean(preferences->SaveTogglePreferences) << ",\n";
+                f << "    \"slashKey\": " << boolean(preferences->SlashKey) << ",\n";
+                f << "    \"editOnRelease\": " << boolean(preferences->EditOnRelease) << ",\n";
+                f << "    \"resetOnRelease\": " << boolean(preferences->ResetOnRelease) << ",\n";
+                f << "    \"disablePreEdits\": " << boolean(preferences->DisablePreEdits) << ",\n";
+                f << "    \"mobileBuilds\": " << boolean(preferences->MobileBuilds) << ",\n";
+                f << "    \"inGameFog\": " << boolean(preferences->InGameFog) << ",\n";
+                f << "    \"sprintByDefault\": " << boolean(preferences->SprintByDefault) << ",\n";
+                f << "    \"respawnsEnabled\": " << boolean(preferences->RespawnsEnabled) << "\n";
+                f << "  }";
+            }
+            f << ",\n";
+        }
         f << "  \"commands\": [\n";
 
         for (size_t i = 0; i < commands.size(); i++)
@@ -551,8 +756,17 @@ namespace HotkeyPersist
             ParseIntField(ReadFileContents(), "consoleMode", 0));
     }
 
+    inline UserPreferences LoadUserPreferences(
+        const UserPreferences& defaults = UserPreferences{})
+    {
+        return ParseUserPreferences(
+            ReadFileContents(), defaults);
+    }
+
     inline void Save(int vk, const char* key = "hotkey")
     {
+        std::lock_guard<std::recursive_mutex> lock(
+            GetSettingsMutex());
         std::string content = ReadFileContents();
 
         int hotkey = ParseKey(content, "hotkey", VK_F9);
@@ -572,6 +786,8 @@ namespace HotkeyPersist
 
     inline void SaveConsoleMode(int consoleMode)
     {
+        std::lock_guard<std::recursive_mutex> lock(
+            GetSettingsMutex());
         const std::string content = ReadFileContents();
         SaveAll(ParseKey(content, "hotkey", VK_F9),
             ParseKey(content, "joinHotkey", VK_F5),
@@ -579,13 +795,54 @@ namespace HotkeyPersist
             ParseCommands(content), ParseMacros(content));
     }
 
-    inline void SaveCommands(const std::vector<CommandBind>& commands,
-        const std::vector<CommandMacro>& macros = ParseMacros(ReadFileContents()))
+    inline void SaveCommands(
+        const std::vector<CommandBind>& commands,
+        const std::vector<CommandMacro>& macros)
     {
+        std::lock_guard<std::recursive_mutex> lock(
+            GetSettingsMutex());
         std::string content = ReadFileContents();
         SaveAll(ParseKey(content, "hotkey", VK_F9),
             ParseKey(content, "joinHotkey", VK_F5),
             SanitizeConsoleMode(ParseIntField(content, "consoleMode", 0)),
             commands, macros);
+    }
+
+    inline void SaveUserPreferences(
+        const UserPreferences& preferences)
+    {
+        std::lock_guard<std::recursive_mutex> lock(
+            GetSettingsMutex());
+        const std::string content = ReadFileContents();
+        SaveAll(ParseKey(content, "hotkey", VK_F9),
+            ParseKey(content, "joinHotkey", VK_F5),
+            SanitizeConsoleMode(
+                ParseIntField(content, "consoleMode", 0)),
+            ParseCommands(content), ParseMacros(content),
+            &preferences);
+    }
+
+    inline void SaveTogglePreferencesMode(
+        bool enabled,
+        const UserPreferences& enabledPreferences)
+    {
+        std::lock_guard<std::recursive_mutex> lock(
+            GetSettingsMutex());
+        const std::string content = ReadFileContents();
+
+        // Disabling persistence remembers only the master switch change and
+        // preserves the last preferred snapshot. Re-enabling adopts the
+        // current session values supplied by the caller.
+        UserPreferences preferences = enabled
+            ? enabledPreferences
+            : ParseUserPreferences(content, UserPreferences{});
+        preferences.SaveTogglePreferences = enabled;
+
+        SaveAll(ParseKey(content, "hotkey", VK_F9),
+            ParseKey(content, "joinHotkey", VK_F5),
+            SanitizeConsoleMode(
+                ParseIntField(content, "consoleMode", 0)),
+            ParseCommands(content), ParseMacros(content),
+            &preferences);
     }
 }

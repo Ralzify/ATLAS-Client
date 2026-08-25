@@ -1409,15 +1409,6 @@ static bool InstallGameThreadPump()
 
 void Client::Init()
 {
-	if (VersionInfo.EngineVersion < 4.24)
-		FConfiguration::bEOREnabled = true;
-	if (VersionInfo.FortniteVersion < 24.30)
-		FConfiguration::bROREnabled = true;
-	if (VersionInfo.FortniteVersion < 15.20)
-		FConfiguration::bDisablePreEdits = true;
-	if (VersionInfo.FortniteVersion < 5.00)
-		FConfiguration::bSprintByDefault = true;
-
 	if (VersionInfo.FortniteVersion < 24.30)
 	{
 		auto CompRef = Memcury::Scanner::FindStringRef(L"EditModeInputComponent0").Get();

@@ -22,7 +22,7 @@ ATLAS Console is a lightweight in-game overlay and client mod for OGFN private s
 
 - Toggle the overlay in-game with a configurable hotkey (default: F9).
 
-- The menu and Join hotkeys, plus the selected console mode, are saved automatically in `%APPDATA%\\ATLAS\\console.json`.
+- Hotkeys, console preferences, persistent toggle states, commands, and macros are saved automatically in `%APPDATA%\\ATLAS\\console.json`.
 
 - Clean, non-intrusive UI — hidden until summoned, blocks no gameplay when closed.
 
@@ -56,7 +56,7 @@ ATLAS Console is a lightweight in-game overlay and client mod for OGFN private s
 
 
 
-- **Enhanced UE-Style Console** — F8 or Unreal's normal backtick/tilde key cycles from a compact command field at the bottom to a full-screen, bottom-anchored console, then closes it. Running a command from the compact field closes it automatically. Recent lines grow upward from the bottom with native-style command spacing and white text, and the bar includes a compact log-clear control. Up/Down shows and navigates a compact monochrome history list.
+- **Enhanced UE-Style Console** — F8 or Unreal's normal backtick/tilde key cycles from a compact command field at the bottom to a full-screen, bottom-anchored console, then closes it. When ATLAS Console and the default-on Slash Key preference are selected, pressing `/` during gameplay opens the compact console with `/` already entered; Original UE Console receives the key normally. Escape clears non-empty console text first, then closes the console on the next press. Running a command from the compact field closes it automatically. Recent lines grow upward from the bottom with native-style command spacing and white text, and the bar includes a compact log-clear control. Up/Down shows and navigates a compact monochrome history list.
 
 - **History and Completion** — Use Up/Down to browse prior commands and Tab to complete from recent or saved commands.
 
@@ -68,13 +68,19 @@ ATLAS Console is a lightweight in-game overlay and client mod for OGFN private s
 
 - **Balanced Mouse Hotkeys** — Mixed raw-mouse packets are routed as a complete packet, keeping every forwarded button-down paired with its release even when MOUSE4/MOUSE5 is assigned to an ATLAS command.
 
-- **Selectable Backend** — The Config tab switches between ATLAS Console and Original UE Console. ATLAS is the default and the preference is saved.
+- **Preferences** — The Config tab switches between ATLAS Console and Original UE Console and can enable or disable the Slash Key shortcut. Save Toggle Preferences controls whether managed toggles restore saved choices or start from defaults each session. All three preferences are enabled by default.
 
   Close the active console before changing backends so Unreal can finish its own open/close state transition.
 
-- **Potato Graphics** — Applies `r.MipMapLODBias 7` for maximum FPS; revert restores `r.MipMapLODBias 0`.
+- **Mobile Builds** — Toggles static-mesh LOD distance scaling between `r.StaticMeshLODDistanceScale 1000` and Unreal's normal value of `1`.
 
-- **FOV Slider** — Set field of view from 0° to 175° via `fov <value>`.
+- **Gameplay Fog** — Toggles gameplay fog with `r.Fog 1` and `r.Fog 0`; enabled by default.
+
+- **Potato Graphics** — Adjusts `r.MipMapLODBias` from 0–15 with a live slider. Right-click the slider to type an exact clamped value.
+
+- **FOV Slider** — Set field of view from 1° to 175° via `fov <value>`. Right-click the slider to type an exact clamped value.
+
+- **Other Tools** — Toggle target information on any supported build, plus the debug camera through Fortnite 10.40.
 
 - **Resolution Dropdown** — Switch between 1920×1080, 1720×1080 (stretched res), and 1280×720. Requires fullscreen.
 
@@ -86,7 +92,13 @@ ATLAS Console is a lightweight in-game overlay and client mod for OGFN private s
 
 - **Rebind Menu Key** — Reassign the menu toggle (default: F9).
 
-- **Console Keys** — Uses F8 and Unreal's native backtick/tilde binding rather than a separate configurable ATLAS hotkey.
+- **Console Keys** — Uses F8 and Unreal's native backtick/tilde binding for the three-state console cycle; `/` opens the ATLAS command field only when ATLAS Console and Slash Key are enabled.
+
+- **Saved Toggles** — With Save Toggle Preferences enabled, editing, graphics, movement, respawn, and Slash Key preferences are written immediately and restored on the next inject. When disabled, those settings use defaults on each inject and changes last only for the current session. Debug Camera and Target Info are always session-only.
+
+- **Reset All** — Restores console style, hotkeys, toggle preferences, graphics sliders, FOV, host fields, commands, and macros to their defaults and reapplies command-backed defaults in game.
+
+- **Editable Saved Commands** — Double-click a saved command, macro step, or the wait time between macro steps to edit it inline. Enter or clicking away saves a valid edit; Escape restores the original value.
 
 - **Rebind Join Key** — Reassign quick Join (default: F5).
 
@@ -195,11 +207,11 @@ The DLL is provided via ATLAS Link. If you are using our launcher, this is the d
 
 
 
-## Hotkey Persistence
+## Settings Persistence
 
 
 
-The console mode, menu and Join hotkeys, command binds, and macros are saved to:
+The console mode, toggle preferences, menu and Join hotkeys, command binds, and macros are saved to:
 
 
 
@@ -221,6 +233,17 @@ Example file:
   "hotkey": 120,
   "joinHotkey": 116,
   "consoleMode": 0,
+  "preferences": {
+    "saveTogglePreferences": true,
+    "slashKey": true,
+    "editOnRelease": true,
+    "resetOnRelease": true,
+    "disablePreEdits": true,
+    "mobileBuilds": false,
+    "inGameFog": true,
+    "sprintByDefault": true,
+    "respawnsEnabled": true
+  },
   "commands": [],
   "macros": []
 }
@@ -229,7 +252,7 @@ Example file:
 
 
 
-Hotkeys use Windows Virtual Key codes (`120` = F9 and `116` = F5). `consoleMode` is `0` for ATLAS Console and `1` for Original UE Console. The file is created automatically and read on every inject.
+Hotkeys use Windows Virtual Key codes (`120` = F9 and `116` = F5). `consoleMode` is `0` for ATLAS Console and `1` for Original UE Console. Missing preference fields use ATLAS defaults, while version gates decide where legacy-only features are available. When `saveTogglePreferences` is `false`, ATLAS remembers that master choice but ignores the remaining saved toggle values and applies defaults for the session. The file is created automatically and read on every inject.
 
 
 

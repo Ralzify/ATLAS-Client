@@ -6,6 +6,7 @@
 #include "../Public/Diagnostics.h"
 #include "../Public/Icon.h"
 #include "../ImGui/imgui.h"
+#include "../ImGui/imgui_internal.h"
 #include "../ImGui/imgui_stdlib.h"
 
 #include <sstream>
@@ -28,7 +29,6 @@ extern void* SelectEdit(void*);
 extern void* SelectReset(void*);
 extern bool ATLAS_PrepareReplicationForOpen(
     const char* command,
-    bool remoteDurianLegacy,
     wchar_t* error,
     size_t errorCapacity);
 
@@ -77,9 +77,36 @@ struct FConsoleUiState
     uint64_t InitialHelpSession = 0;
     unsigned int InitialHelpAttempts = 0;
     ULONGLONG NextInitialHelpAttemptAt = 0;
+    bool ReloadInput = false;
+    bool SlashPrefillActive = false;
+    bool RefocusAfterEscapeClear = false;
+};
+
+enum class ESavedCommandEditTarget : uint8_t
+{
+    None,
+    Command,
+    MacroStep,
+    MacroDelay
+};
+
+struct FSavedCommandEditState
+{
+    ESavedCommandEditTarget Target =
+        ESavedCommandEditTarget::None;
+    int CommandIndex = -1;
+    int MacroIndex = -1;
+    int StepIndex = -1;
+    std::string Draft;
+    std::string Original;
+    int DelayDraft = 250;
+    int DelayOriginal = 250;
+    std::string Error;
+    bool FocusNextFrame = false;
 };
 
 static FConsoleUiState g_ConsoleUi;
+static FSavedCommandEditState g_SavedCommandEdit;
 static std::deque<FConsoleLine> g_ConsoleLines;
 static size_t g_ConsoleLineBytes = 0;
 static uint64_t g_NextConsoleLineId = 1;
@@ -95,6 +122,18 @@ static bool g_FocusMenuWindow = false;
 static bool g_MenuWindowFocused = false;
 static ULONGLONG g_BindErrorUntil = 0;
 static std::string g_BindError;
+static constexpr unsigned int SettingCommandMobileBuilds = 1u << 0;
+static constexpr unsigned int SettingCommandInGameFog = 1u << 1;
+static constexpr unsigned int SettingCommandDebugCamera = 1u << 2;
+static constexpr unsigned int SettingCommandTargetInfo = 1u << 3;
+static constexpr unsigned int SettingCommandMipMapLODBias = 1u << 4;
+static constexpr unsigned int SettingCommandFOV = 1u << 5;
+static std::atomic_uint g_PendingSettingCommandMask = 0;
+// Coordinate command-backed menu changes with game-thread dispatch. Debug
+// Camera and Target Info additionally need an assumed applied state because
+// UE exposes them as toggle-only commands.
+static std::mutex g_SettingCommandMutex;
+static unsigned int g_AppliedToggleSettingMask = 0;
 
 static constexpr size_t kMaximumConsoleLines = 2048;
 static constexpr size_t kMaximumConsoleBytes = 1024 * 1024;
@@ -108,11 +147,19 @@ static constexpr size_t kMaximumDrainBytesPerFrame = 64 * 1024;
 static constexpr unsigned int kMaximumInitialHelpAttempts = 3;
 static constexpr ULONGLONG kInitialHelpRetryMs = 5000;
 
-static bool IsUnrealConsoleHotkey(int vk)
+static void CancelSavedCommandEdit()
+{
+    g_SavedCommandEdit = {};
+}
+
+static bool FinishSavedCommandEdit(bool keepOpenOnInvalid);
+
+static bool IsReservedConsoleHotkey(int vk)
 {
     // Both characters produced by the Tilde key arrive as VK_OEM_3. F8 is
-    // ATLAS's second fixed alias for the same UE-style console cycle.
-    return vk == VK_OEM_3 || vk == VK_F8;
+    // ATLAS's second fixed alias for the same UE-style console cycle. Slash
+    // is a fixed shortcut that opens the compact ATLAS console with `/` ready.
+    return vk == VK_OEM_3 || vk == VK_F8 || vk == VK_OEM_2;
 }
 
 bool GUI_IsOverlayVisible()
@@ -442,6 +489,192 @@ static void RefreshExclusiveCommandHotkeys()
     }
 }
 
+static HotkeyPersist::UserPreferences DefaultUserPreferences()
+{
+    // One console.json is shared across supported builds. Keep the legacy
+    // feature defaults enabled in storage; version gates decide whether each
+    // preference is displayed or used on the current build.
+    return HotkeyPersist::UserPreferences{};
+}
+
+static HotkeyPersist::UserPreferences CaptureUserPreferences()
+{
+    HotkeyPersist::UserPreferences preferences{};
+    preferences.SaveTogglePreferences =
+        FConfiguration::bSaveTogglePreferences.load(
+            std::memory_order_acquire);
+    preferences.SlashKey =
+        FConfiguration::bSlashKeyEnabled.load(
+            std::memory_order_acquire);
+    preferences.EditOnRelease =
+        FConfiguration::bEOREnabled.load(
+            std::memory_order_acquire);
+    preferences.ResetOnRelease =
+        FConfiguration::bROREnabled.load(
+            std::memory_order_acquire);
+    preferences.DisablePreEdits =
+        FConfiguration::bDisablePreEdits.load(
+            std::memory_order_acquire);
+    preferences.MobileBuilds =
+        FConfiguration::bMobileBuilds.load(
+            std::memory_order_acquire);
+    preferences.InGameFog =
+        FConfiguration::bGameplayFog.load(
+            std::memory_order_acquire);
+    preferences.SprintByDefault =
+        FConfiguration::bSprintByDefault.load(
+            std::memory_order_acquire);
+    preferences.RespawnsEnabled =
+        FConfiguration::bForceRespawns.load(
+            std::memory_order_acquire);
+    return preferences;
+}
+
+static void ApplyUserPreferences(
+    const HotkeyPersist::UserPreferences& preferences)
+{
+    FConfiguration::bSaveTogglePreferences.store(
+        preferences.SaveTogglePreferences,
+        std::memory_order_release);
+    FConfiguration::bSlashKeyEnabled.store(
+        preferences.SlashKey, std::memory_order_release);
+    FConfiguration::bEOREnabled.store(
+        preferences.EditOnRelease, std::memory_order_release);
+    FConfiguration::bROREnabled.store(
+        preferences.ResetOnRelease, std::memory_order_release);
+    FConfiguration::bDisablePreEdits.store(
+        preferences.DisablePreEdits, std::memory_order_release);
+    FConfiguration::bMobileBuilds.store(
+        preferences.MobileBuilds, std::memory_order_release);
+    FConfiguration::bGameplayFog.store(
+        preferences.InGameFog, std::memory_order_release);
+    FConfiguration::bSprintByDefault.store(
+        preferences.SprintByDefault, std::memory_order_release);
+    FConfiguration::bForceRespawns.store(
+        preferences.RespawnsEnabled, std::memory_order_release);
+}
+
+void GUI_LoadUserPreferences()
+{
+    const HotkeyPersist::UserPreferences savedPreferences =
+        HotkeyPersist::LoadUserPreferences(
+            DefaultUserPreferences());
+    HotkeyPersist::UserPreferences preferences =
+        savedPreferences.SaveTogglePreferences
+            ? savedPreferences
+            : DefaultUserPreferences();
+    // The master preference always persists independently. When it is off,
+    // every managed toggle starts from its canonical default for this session.
+    preferences.SaveTogglePreferences =
+        savedPreferences.SaveTogglePreferences;
+    ApplyUserPreferences(preferences);
+
+    unsigned int commandMask =
+        SettingCommandMobileBuilds |
+        SettingCommandInGameFog;
+    {
+        std::lock_guard<std::mutex> lock(
+            g_SettingCommandMutex);
+        g_AppliedToggleSettingMask = 0;
+        g_PendingSettingCommandMask.store(
+            commandMask, std::memory_order_release);
+    }
+}
+
+static void SaveUserPreferences()
+{
+    if (!FConfiguration::bSaveTogglePreferences.load(
+            std::memory_order_acquire))
+    {
+        return;
+    }
+    HotkeyPersist::SaveUserPreferences(
+        CaptureUserPreferences());
+}
+
+static bool TogglePreferencePersistenceCheckbox()
+{
+    bool value = FConfiguration::bSaveTogglePreferences.load(
+        std::memory_order_acquire);
+    if (!ImGui::Checkbox("Save Toggle Preferences", &value))
+        return false;
+
+    FConfiguration::bSaveTogglePreferences.store(
+        value, std::memory_order_release);
+    HotkeyPersist::SaveTogglePreferencesMode(
+        value, CaptureUserPreferences());
+    return true;
+}
+
+static bool PersistentCheckbox(
+    const char* label,
+    std::atomic_bool& setting)
+{
+    bool value = setting.load(std::memory_order_acquire);
+    if (!ImGui::Checkbox(label, &value))
+        return false;
+
+    setting.store(value, std::memory_order_release);
+    SaveUserPreferences();
+    return true;
+}
+
+static void ReconcileToggleSettingCommandLocked(
+    unsigned int bit,
+    bool desired)
+{
+    const bool applied =
+        (g_AppliedToggleSettingMask & bit) != 0;
+    if (desired != applied)
+    {
+        g_PendingSettingCommandMask.fetch_or(
+            bit, std::memory_order_acq_rel);
+    }
+    else
+    {
+        g_PendingSettingCommandMask.fetch_and(
+            ~bit, std::memory_order_acq_rel);
+    }
+}
+
+static bool SessionToggleCommandCheckbox(
+    const char* label,
+    std::atomic_bool& setting,
+    unsigned int bit)
+{
+    bool value = setting.load(std::memory_order_acquire);
+    if (!ImGui::Checkbox(label, &value))
+        return false;
+
+    {
+        std::lock_guard<std::mutex> lock(
+            g_SettingCommandMutex);
+        setting.store(value, std::memory_order_release);
+        ReconcileToggleSettingCommandLocked(bit, value);
+    }
+    return true;
+}
+
+static bool PersistentAbsoluteCommandCheckbox(
+    const char* label,
+    std::atomic_bool& setting,
+    unsigned int bit)
+{
+    bool value = setting.load(std::memory_order_acquire);
+    if (!ImGui::Checkbox(label, &value))
+        return false;
+
+    {
+        std::lock_guard<std::mutex> lock(
+            g_SettingCommandMutex);
+        setting.store(value, std::memory_order_release);
+        g_PendingSettingCommandMask.fetch_or(
+            bit, std::memory_order_acq_rel);
+    }
+    SaveUserPreferences();
+    return true;
+}
+
 void FGUI::SaveHotkey()
 {
     const int hotkey = HotkeyPersist::SanitizeRequiredMenuHotkey(
@@ -469,6 +702,7 @@ void FGUI::SaveCommands()
 
 void FGUI::LoadCommands()
 {
+    CancelSavedCommandEdit();
     FGUI::Commands = HotkeyPersist::LoadCommands();
     RefreshExclusiveCommandHotkeys();
 }
@@ -481,16 +715,51 @@ void FGUI::SaveMacros()
 
 void FGUI::LoadMacros()
 {
+    CancelSavedCommandEdit();
     FGUI::Macros = HotkeyPersist::LoadMacros();
     RefreshExclusiveCommandHotkeys();
 }
 
 void FGUI::ResetAll()
 {
+    CancelSavedCommandEdit();
+    const HotkeyPersist::UserPreferences defaults =
+        DefaultUserPreferences();
+
+    // Reset desired state and queue every command-backed default while
+    // serialized against the game-thread dispatcher. Toggle-only commands
+    // reconcile from their known applied state instead of blindly inverting.
+    {
+        std::lock_guard<std::mutex> lock(
+            g_SettingCommandMutex);
+        ApplyUserPreferences(defaults);
+        FConfiguration::bDebugCamera.store(
+            false, std::memory_order_release);
+        FConfiguration::bTargetInfo.store(
+            false, std::memory_order_release);
+        FConfiguration::MipMapLODBias.store(
+            0, std::memory_order_release);
+        FConfiguration::FOV.store(
+            80, std::memory_order_release);
+        g_PendingSettingCommandMask.fetch_or(
+            SettingCommandMobileBuilds |
+            SettingCommandInGameFog |
+            SettingCommandMipMapLODBias |
+            SettingCommandFOV,
+            std::memory_order_acq_rel);
+        ReconcileToggleSettingCommandLocked(
+            SettingCommandDebugCamera, false);
+        ReconcileToggleSettingCommandLocked(
+            SettingCommandTargetInfo, false);
+    }
+
     FGUI::HotkeyVK = HotkeyPersist::DefaultMenuHotkeyVK;
     FGUI::JoinHotkeyVK = VK_F5;
     FConfiguration::ConsoleMode.store(
         static_cast<int>(EConsoleMode::Atlas), std::memory_order_release);
+    FGUI::ActiveTab = 0;
+    FGUI::HostType = 0;
+    FGUI::RemoteIP[0] = '\0';
     FGUI::bRebinding = false;
     FGUI::bRebindingJoin = false;
     FGUI::RebindingCommandIndex = -2;
@@ -504,7 +773,7 @@ void FGUI::ResetAll()
     RefreshExclusiveCommandHotkeys();
 
     HotkeyPersist::SaveAll(FGUI::HotkeyVK, FGUI::JoinHotkeyVK,
-        static_cast<int>(EConsoleMode::Atlas), {}, {});
+        static_cast<int>(EConsoleMode::Atlas), {}, {}, &defaults);
 }
 
 void GUI_LoadTextures(ID3D11Device* device)
@@ -881,24 +1150,86 @@ static void PushStyle()
     col[ImGuiCol_ModalWindowDimBg] = C(0.f, 0.f, 0.f, 0.55f);
 }
 
-static void AccentRule()
-{
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    const ImVec2 p = ImGui::GetCursorScreenPos();
-    const float w = ImGui::GetContentRegionAvail().x;
-    dl->AddLine(ImVec2(p.x, p.y + 1.f), ImVec2(p.x + w, p.y + 1.f),
-        ImGui::GetColorU32(Accent(0.25f)), 1.f);
-    ImGui::Dummy(ImVec2(0.f, 3.f));
-}
+static constexpr float ContentHorizontalInset = 22.f;
+static constexpr float SectionBodyIndent = 10.f;
 
 static void SectionLabel(const char* label)
 {
     ImGui::Spacing();
-    ImGui::PushStyleColor(ImGuiCol_Text, Accent(0.85f));
+
+    constexpr float HeaderHeight = 28.f;
+    const ImVec2 pos = ImGui::GetCursorScreenPos();
+    const float headerWidth = (std::max)(
+        1.f,
+        ImGui::GetContentRegionAvail().x -
+            ContentHorizontalInset);
+    const ImVec2 end(
+        pos.x + headerWidth,
+        pos.y + HeaderHeight);
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+
+    drawList->AddRectFilled(
+        pos, end,
+        ImGui::GetColorU32(ImGuiCol_FrameBg), 4.f);
+    drawList->AddRectFilled(
+        pos, ImVec2(pos.x + 3.f, end.y),
+        ImGui::GetColorU32(Accent()), 4.f);
+
+    ImGui::SetCursorScreenPos(ImVec2(
+        pos.x + 12.f,
+        pos.y +
+            (HeaderHeight - ImGui::GetTextLineHeight()) * 0.5f));
     ImGui::TextUnformatted(label);
-    ImGui::PopStyleColor();
-    AccentRule();
-    ImGui::Spacing();
+
+    ImGui::SetCursorScreenPos(ImVec2(pos.x, end.y + 8.f));
+}
+
+static void BeginSectionBody()
+{
+    ImGui::Indent(SectionBodyIndent);
+    ImGui::PushStyleVar(
+        ImGuiStyleVar_ItemSpacing, ImVec2(12.f, 7.f));
+    ImGui::PushStyleVar(
+        ImGuiStyleVar_ItemInnerSpacing, ImVec2(8.f, 4.f));
+    ImGui::PushStyleVar(
+        ImGuiStyleVar_FramePadding, ImVec2(4.f, 3.f));
+}
+
+static void EndSectionBody()
+{
+    ImGui::PopStyleVar(3);
+    ImGui::Unindent(SectionBodyIndent);
+}
+
+static bool LabeledSliderInt(
+    const char* label,
+    const char* id,
+    int* value,
+    int minimum,
+    int maximum,
+    float width,
+    const char* format = "%d")
+{
+    ImGui::TextUnformatted(label);
+    ImGui::SetNextItemWidth(width);
+    return ImGui::SliderInt(
+        id, value, minimum, maximum, format,
+        ImGuiSliderFlags_AlwaysClamp);
+}
+
+static bool LabeledCombo(
+    const char* label,
+    const char* id,
+    int* value,
+    const char* const items[],
+    int itemCount,
+    float width)
+{
+    if (label && label[0] != '\0')
+        ImGui::TextUnformatted(label);
+    ImGui::SetNextItemWidth(width);
+    return ImGui::Combo(
+        id, value, items, itemCount);
 }
 
 static bool SidebarTab(const char* label, int index, float height)
@@ -1912,8 +2243,6 @@ static bool ExecNow(const char* cmd, bool showConsoleErrors = true)
     wchar_t transportError[256]{};
     if (!ATLAS_PrepareReplicationForOpen(
             cmd,
-            FGUI::bRemoteDurianLegacyReplication.load(
-                std::memory_order_acquire),
             transportError,
             std::size(transportError)))
     {
@@ -2165,6 +2494,160 @@ static void PumpGameplayMouseRestore()
     }
 }
 
+static bool TryApplyPendingSettingCommand()
+{
+    if (Client::GetConsoleSessionGeneration() == 0 ||
+        GetTickCount64() <
+            g_GameThreadCommandReadyAfter.load(
+                std::memory_order_acquire))
+    {
+        return false;
+    }
+
+    std::unique_lock<std::mutex> commandLock(
+        g_SettingCommandMutex);
+    unsigned int mask = g_PendingSettingCommandMask.load(
+        std::memory_order_acquire);
+    if (mask == 0)
+        return false;
+
+    unsigned int bit = 0;
+    const char* command = nullptr;
+    char commandBuffer[64]{};
+    bool toggleCommand = false;
+    bool toggleDesired = false;
+    while (mask != 0 && !command)
+    {
+        if ((mask & SettingCommandMobileBuilds) != 0)
+        {
+            bit = SettingCommandMobileBuilds;
+            command = FConfiguration::bMobileBuilds.load(
+                    std::memory_order_acquire)
+                ? "r.StaticMeshLODDistanceScale 1000"
+                // Unreal's neutral/default scale is 1. A zero scale is not
+                // an off switch and can disrupt mesh LOD streaming while a
+                // map is loading.
+                : "r.StaticMeshLODDistanceScale 1";
+        }
+        else if ((mask & SettingCommandInGameFog) != 0)
+        {
+            bit = SettingCommandInGameFog;
+            command = FConfiguration::bGameplayFog.load(
+                    std::memory_order_acquire)
+                ? "r.Fog 1"
+                : "r.Fog 0";
+        }
+        else if ((mask & SettingCommandMipMapLODBias) != 0)
+        {
+            bit = SettingCommandMipMapLODBias;
+            snprintf(commandBuffer, sizeof(commandBuffer),
+                "r.MipMapLODBias %d",
+                FConfiguration::MipMapLODBias.load(
+                    std::memory_order_acquire));
+            command = commandBuffer;
+        }
+        else if ((mask & SettingCommandFOV) != 0)
+        {
+            bit = SettingCommandFOV;
+            snprintf(commandBuffer, sizeof(commandBuffer),
+                "fov %d",
+                FConfiguration::FOV.load(
+                    std::memory_order_acquire));
+            command = commandBuffer;
+        }
+        else if ((mask & SettingCommandDebugCamera) != 0)
+        {
+            bit = SettingCommandDebugCamera;
+            if (VersionInfo.FortniteVersion > 10.40)
+            {
+                g_PendingSettingCommandMask.fetch_and(
+                    ~bit, std::memory_order_acq_rel);
+                mask &= ~bit;
+            }
+            else
+            {
+                toggleDesired = FConfiguration::bDebugCamera.load(
+                    std::memory_order_acquire);
+                const bool toggleApplied =
+                    (g_AppliedToggleSettingMask & bit) != 0;
+                if (toggleDesired != toggleApplied)
+                {
+                    toggleCommand = true;
+                    command = "toggledebugcamera";
+                }
+                else
+                {
+                    g_PendingSettingCommandMask.fetch_and(
+                        ~bit, std::memory_order_acq_rel);
+                    mask &= ~bit;
+                }
+            }
+        }
+        else if ((mask & SettingCommandTargetInfo) != 0)
+        {
+            bit = SettingCommandTargetInfo;
+            toggleDesired = FConfiguration::bTargetInfo.load(
+                std::memory_order_acquire);
+            const bool toggleApplied =
+                (g_AppliedToggleSettingMask & bit) != 0;
+            if (toggleDesired != toggleApplied)
+            {
+                toggleCommand = true;
+                command = "toggletargetinfo";
+            }
+            else
+            {
+                g_PendingSettingCommandMask.fetch_and(
+                    ~bit, std::memory_order_acq_rel);
+                mask &= ~bit;
+            }
+        }
+        else
+        {
+            // Ignore unknown future bits rather than stalling the game-thread
+            // preference queue forever on a value this build cannot apply.
+            g_PendingSettingCommandMask.fetch_and(
+                ~mask, std::memory_order_acq_rel);
+            mask = 0;
+        }
+    }
+
+    if (!command)
+        return false;
+
+    const bool applied = ExecNow(command, false);
+    if (toggleCommand)
+    {
+        if (applied)
+        {
+            if (toggleDesired)
+                g_AppliedToggleSettingMask |= bit;
+            else
+                g_AppliedToggleSettingMask &= ~bit;
+        }
+
+        const bool desiredNow = bit == SettingCommandDebugCamera
+            ? FConfiguration::bDebugCamera.load(
+                std::memory_order_acquire)
+            : FConfiguration::bTargetInfo.load(
+                std::memory_order_acquire);
+        ReconcileToggleSettingCommandLocked(bit, desiredNow);
+    }
+    else if (applied)
+    {
+        g_PendingSettingCommandMask.fetch_and(
+            ~bit, std::memory_order_acq_rel);
+    }
+    g_GameThreadCommandReadyAfter.store(
+        GetTickCount64() + kGameThreadCommandSettleMs,
+        std::memory_order_release);
+    AtlasDiagnostics::WriteLine(
+        "setting-command %s bit=0x%X command=%s",
+        applied ? "applied" : "retry",
+        bit, command);
+    return true;
+}
+
 void GUI_PumpGameThreadCommands()
 {
     bool expected = false;
@@ -2172,6 +2655,14 @@ void GUI_PumpGameThreadCommands()
         expected, true, std::memory_order_acq_rel,
         std::memory_order_acquire))
     {
+        return;
+    }
+
+    if (TryApplyPendingSettingCommand())
+    {
+        g_GameThreadCommandExecuting.store(
+            false, std::memory_order_release);
+        PumpGameplayMouseRestore();
         return;
     }
 
@@ -2223,6 +2714,20 @@ struct QueuedMacroRun
 
 static std::deque<QueuedMacroRun> g_MacroRunQueue;
 
+static bool MatchesCommandFamily(
+    const char* command,
+    const char* family)
+{
+    if (!command || !family)
+        return false;
+
+    const size_t familyLength = strlen(family);
+    return _strnicmp(command, family, familyLength) == 0 &&
+        (command[familyLength] == '\0' ||
+            std::isspace(static_cast<unsigned char>(
+                command[familyLength])));
+}
+
 static bool Exec(const char* cmd)
 {
     if (!cmd || !*cmd)
@@ -2235,13 +2740,30 @@ static bool Exec(const char* cmd)
         return false;
     }
 
-    // Slider updates only need the newest FOV value; allowing old values to
-    // accumulate would delay later commands unnecessarily.
-    if (strncmp(cmd, "fov", 3) == 0 && (cmd[3] == '\0' || cmd[3] == ' '))
+    // Live controls only need their newest value. Coalescing them keeps a
+    // dragged slider from filling the bounded queue with stale settings.
+    static const char* const coalescedCommandFamilies[] = {
+        "fov",
+        "r.StaticMeshLODDistanceScale",
+        "r.MipMapLODBias",
+        "r.Fog"
+    };
+    const char* coalescedFamily = nullptr;
+    for (const char* family : coalescedCommandFamilies)
+    {
+        if (MatchesCommandFamily(cmd, family))
+        {
+            coalescedFamily = family;
+            break;
+        }
+    }
+
+    if (coalescedFamily)
     {
         for (auto it = g_CommandQueue.begin(); it != g_CommandQueue.end();)
         {
-            if (it->compare(0, 3, "fov") == 0 && (it->size() == 3 || (*it)[3] == ' '))
+            if (MatchesCommandFamily(
+                    it->c_str(), coalescedFamily))
                 it = g_CommandQueue.erase(it);
             else
                 ++it;
@@ -2502,12 +3024,12 @@ void GUI_Init()
     int menuHotkey = FGUI::HotkeyVK.load(std::memory_order_acquire);
     int joinHotkey = FGUI::JoinHotkeyVK.load(std::memory_order_acquire);
 
-    if (IsUnrealConsoleHotkey(menuHotkey))
+    if (IsReservedConsoleHotkey(menuHotkey))
     {
         static const int menuFallbacks[] = { VK_F9, VK_F10, VK_F11, VK_F12 };
         for (int fallback : menuFallbacks)
         {
-            if (fallback != joinHotkey && !IsUnrealConsoleHotkey(fallback))
+            if (fallback != joinHotkey && !IsReservedConsoleHotkey(fallback))
             {
                 menuHotkey = fallback;
                 FGUI::HotkeyVK.store(menuHotkey, std::memory_order_release);
@@ -2526,7 +3048,7 @@ void GUI_Init()
         FGUI::JoinHotkeyVK.store(joinHotkey, std::memory_order_release);
     }
 
-    if (joinHotkey == menuHotkey || IsUnrealConsoleHotkey(joinHotkey))
+    if (joinHotkey == menuHotkey || IsReservedConsoleHotkey(joinHotkey))
     {
         static const int fallbacks[] = {
             VK_F5, VK_F6, VK_F7, VK_F10, VK_F11, VK_F12
@@ -2534,7 +3056,7 @@ void GUI_Init()
         for (int fallback : fallbacks)
         {
             if (fallback != menuHotkey &&
-                !IsUnrealConsoleHotkey(fallback))
+                !IsReservedConsoleHotkey(fallback))
             {
                 joinHotkey = fallback;
                 FGUI::JoinHotkeyVK.store(joinHotkey, std::memory_order_release);
@@ -2549,7 +3071,7 @@ void GUI_Init()
     {
         return vk > 0 &&
             (vk == menuHotkey || vk == joinHotkey ||
-                IsUnrealConsoleHotkey(vk));
+                IsReservedConsoleHotkey(vk));
     };
     for (auto& command : FGUI::Commands)
     {
@@ -2674,11 +3196,20 @@ static bool IsAtlasConsoleSelected()
         static_cast<int>(EConsoleMode::Atlas);
 }
 
+static bool IsSlashConsoleShortcutEnabled()
+{
+    return IsAtlasConsoleSelected() &&
+        FConfiguration::bSlashKeyEnabled.load(
+            std::memory_order_acquire);
+}
+
 static bool IsAtlasOwnedHotkey(int vk)
 {
     return vk > 0 && vk <= 0xFE &&
         (vk == FGUI::HotkeyVK || vk == FGUI::JoinHotkeyVK ||
             vk == VK_F8 ||
+            (vk == VK_OEM_2 &&
+                IsSlashConsoleShortcutEnabled()) ||
             (IsAtlasConsoleSelected() && vk == VK_OEM_3) ||
             IsExclusiveCommandHotkey(vk));
 }
@@ -2774,6 +3305,7 @@ static void CancelBindCapture()
 
 static void CloseMenuSurface()
 {
+    FinishSavedCommandEdit(false);
     FGUI::bVisible.store(false, std::memory_order_release);
     g_MenuWindowFocused = false;
     CancelBindCapture();
@@ -2784,24 +3316,22 @@ static void CloseMenuSurface()
 static void CloseConsoleSurface()
 {
     FGUI::bConsoleVisible.store(false, std::memory_order_release);
+    if (g_ConsoleUi.SlashPrefillActive)
+    {
+        // A synthetic slash belongs only to the shortcut-opened console. Do
+        // not let it become a draft on a later F8/backtick opening.
+        g_ConsoleUi.Input.clear();
+        g_ConsoleUi.ReloadInput = true;
+        g_ConsoleUi.SlashPrefillActive = false;
+    }
     g_ConsoleUi.WindowFocused = false;
+    g_ConsoleUi.RefocusAfterEscapeClear = false;
     g_ConsoleUi.HistoryPosition = -1;
     g_ConsoleUi.Draft.clear();
     g_ConsoleUi.CompletionMatches.clear();
     g_ConsoleUi.CompletionPosition = -1;
     if (FGUI::bVisible.load(std::memory_order_acquire))
         g_FocusMenuWindow = true;
-}
-
-static bool DismissConsoleHistory()
-{
-    if (g_ConsoleUi.HistoryPosition < 0)
-        return false;
-
-    g_ConsoleUi.HistoryPosition = -1;
-    g_ConsoleUi.Draft.clear();
-    g_ConsoleUi.FocusInput = true;
-    return true;
 }
 
 static int PollBindKey(const InputPressCounts& presses)
@@ -2824,7 +3354,7 @@ static bool IsReservedOverlayKey(int vk, int except)
 {
     return (except != 0 && vk == FGUI::HotkeyVK) ||
         (except != 1 && vk == FGUI::JoinHotkeyVK) ||
-        IsUnrealConsoleHotkey(vk);
+        IsReservedConsoleHotkey(vk);
 }
 
 static bool IsSavedActionHotkey(int vk)
@@ -2908,7 +3438,7 @@ void GUI_HandleInput(bool windowActive)
         {
             if (IsReservedOverlayKey(vk, -1))
             {
-                SetBindError("Menu, Join, and Unreal console keys are reserved.");
+                SetBindError("Menu, Join, and console keys are reserved.");
             }
             else if (FGUI::RebindingCommandIndex == -1)
             {
@@ -2932,7 +3462,7 @@ void GUI_HandleInput(bool windowActive)
         {
             if (IsReservedOverlayKey(vk, -1))
             {
-                SetBindError("Menu, Join, and Unreal console keys are reserved.");
+                SetBindError("Menu, Join, and console keys are reserved.");
             }
             else if (FGUI::RebindingMacroIndex >= 0 && FGUI::RebindingMacroIndex < (int)FGUI::Macros.size())
             {
@@ -2958,6 +3488,28 @@ void GUI_HandleInput(bool windowActive)
             FGUI::bVisible.store(true, std::memory_order_release);
             g_FocusMenuWindow = true;
         }
+    }
+
+    const unsigned int slashConsolePresses =
+        TakePressCount(presses, VK_OEM_2);
+    if (slashConsolePresses > 0 &&
+        IsSlashConsoleShortcutEnabled() &&
+        !wasOverlayVisible && !GUI_IsOverlayVisible())
+    {
+        g_ConsoleUi.Expanded = false;
+        g_ConsoleUi.ResetExpansion = true;
+        g_ConsoleUi.Input = "/";
+        g_ConsoleUi.ReloadInput = true;
+        g_ConsoleUi.SlashPrefillActive = true;
+        g_ConsoleUi.HistoryPosition = -1;
+        g_ConsoleUi.Draft.clear();
+        g_ConsoleUi.CompletionSeed.clear();
+        g_ConsoleUi.CompletionMatches.clear();
+        g_ConsoleUi.CompletionPosition = -1;
+        FGUI::bConsoleVisible.store(true, std::memory_order_release);
+        RefreshInitialHelpSession(true);
+        g_ConsoleUi.FocusInput = true;
+        g_ConsoleUi.ScrollToBottom = true;
     }
 
     const unsigned int consoleHotkeyPresses =
@@ -2996,8 +3548,20 @@ void GUI_HandleInput(bool windowActive)
         unsigned int escapePresses =
             TakePressCount(presses, VK_ESCAPE);
         if (escapePresses > 0 &&
-            DismissConsoleHistory())
+            !g_ConsoleUi.Input.empty())
         {
+            // Clear the backing value here as well as ImGui's active edit
+            // buffer below. This keeps the first Escape deterministic even
+            // if the console input temporarily lost keyboard focus.
+            g_ConsoleUi.Input.clear();
+            g_ConsoleUi.ReloadInput = true;
+            g_ConsoleUi.SlashPrefillActive = false;
+            g_ConsoleUi.HistoryPosition = -1;
+            g_ConsoleUi.Draft.clear();
+            g_ConsoleUi.CompletionSeed.clear();
+            g_ConsoleUi.CompletionMatches.clear();
+            g_ConsoleUi.CompletionPosition = -1;
+            g_ConsoleUi.RefocusAfterEscapeClear = true;
             escapePresses--;
         }
 
@@ -3046,6 +3610,279 @@ static std::string TrimCommand(const std::string& value)
         end--;
 
     return value.substr(start, end - start);
+}
+
+static bool IsEditingSavedCommand(int commandIndex)
+{
+    return g_SavedCommandEdit.Target ==
+            ESavedCommandEditTarget::Command &&
+        g_SavedCommandEdit.CommandIndex == commandIndex;
+}
+
+static bool IsEditingSavedMacroStep(
+    int macroIndex, int stepIndex)
+{
+    return g_SavedCommandEdit.Target ==
+            ESavedCommandEditTarget::MacroStep &&
+        g_SavedCommandEdit.MacroIndex == macroIndex &&
+        g_SavedCommandEdit.StepIndex == stepIndex;
+}
+
+static bool IsEditingSavedMacroDelay(
+    int macroIndex, int stepIndex)
+{
+    return g_SavedCommandEdit.Target ==
+            ESavedCommandEditTarget::MacroDelay &&
+        g_SavedCommandEdit.MacroIndex == macroIndex &&
+        g_SavedCommandEdit.StepIndex == stepIndex;
+}
+
+static bool FinishSavedCommandEdit(bool keepOpenOnInvalid)
+{
+    if (g_SavedCommandEdit.Target ==
+        ESavedCommandEditTarget::None)
+    {
+        return true;
+    }
+
+    const bool validCommandTarget =
+        g_SavedCommandEdit.Target ==
+            ESavedCommandEditTarget::Command &&
+        g_SavedCommandEdit.CommandIndex >= 0 &&
+        g_SavedCommandEdit.CommandIndex <
+            static_cast<int>(FGUI::Commands.size());
+    const bool isMacroEditTarget =
+        g_SavedCommandEdit.Target ==
+            ESavedCommandEditTarget::MacroStep ||
+        g_SavedCommandEdit.Target ==
+            ESavedCommandEditTarget::MacroDelay;
+    const bool validMacroTarget =
+        isMacroEditTarget &&
+        g_SavedCommandEdit.MacroIndex >= 0 &&
+        g_SavedCommandEdit.MacroIndex <
+            static_cast<int>(FGUI::Macros.size()) &&
+        g_SavedCommandEdit.StepIndex >= 0 &&
+        g_SavedCommandEdit.StepIndex <
+            static_cast<int>(FGUI::Macros[
+                static_cast<size_t>(
+                    g_SavedCommandEdit.MacroIndex)].Steps.size());
+    if (!validCommandTarget && !validMacroTarget)
+    {
+        CancelSavedCommandEdit();
+        return false;
+    }
+
+    if (g_SavedCommandEdit.Target ==
+        ESavedCommandEditTarget::MacroDelay)
+    {
+        if (g_SavedCommandEdit.DelayDraft ==
+            g_SavedCommandEdit.DelayOriginal)
+        {
+            CancelSavedCommandEdit();
+            return true;
+        }
+
+        auto& step = FGUI::Macros[static_cast<size_t>(
+            g_SavedCommandEdit.MacroIndex)].Steps[
+                static_cast<size_t>(
+                    g_SavedCommandEdit.StepIndex)];
+        step.DelayMs = HotkeyPersist::SanitizeMacroDelayMs(
+            g_SavedCommandEdit.DelayDraft);
+        FGUI::SaveMacros();
+        CancelSavedCommandEdit();
+        return true;
+    }
+
+    // Escape restores ImGui's activation value. Treat an unchanged draft as
+    // cancellation so it is never normalized or written back unnecessarily.
+    if (g_SavedCommandEdit.Draft ==
+        g_SavedCommandEdit.Original)
+    {
+        CancelSavedCommandEdit();
+        return true;
+    }
+
+    const std::string command =
+        TrimCommand(g_SavedCommandEdit.Draft);
+    const char* error = nullptr;
+    if (command.empty())
+        error = "A saved command cannot be empty.";
+    else if (command.find_first_of("\r\n") != std::string::npos)
+        error = "A saved command must stay on one line.";
+    else if (command.size() > kMaximumConsoleCommandLength)
+        error = "A saved command cannot exceed 2048 bytes.";
+
+    if (error)
+    {
+        if (keepOpenOnInvalid)
+        {
+            g_SavedCommandEdit.Error = error;
+            g_SavedCommandEdit.FocusNextFrame = true;
+        }
+        else
+        {
+            CancelSavedCommandEdit();
+        }
+        return false;
+    }
+
+    if (validCommandTarget)
+    {
+        FGUI::Commands[static_cast<size_t>(
+            g_SavedCommandEdit.CommandIndex)].Command = command;
+        FGUI::SaveCommands();
+    }
+    else
+    {
+        auto& macro = FGUI::Macros[static_cast<size_t>(
+            g_SavedCommandEdit.MacroIndex)];
+        macro.Steps[static_cast<size_t>(
+            g_SavedCommandEdit.StepIndex)].Command = command;
+        if (g_SavedCommandEdit.StepIndex == 0)
+            macro.Name = command;
+        FGUI::SaveMacros();
+    }
+
+    CancelSavedCommandEdit();
+    return true;
+}
+
+static void BeginSavedCommandEdit(int commandIndex)
+{
+    if (commandIndex < 0 || commandIndex >=
+        static_cast<int>(FGUI::Commands.size()))
+    {
+        return;
+    }
+
+    FinishSavedCommandEdit(false);
+    CancelBindCapture();
+    g_SavedCommandEdit.Target =
+        ESavedCommandEditTarget::Command;
+    g_SavedCommandEdit.CommandIndex = commandIndex;
+    g_SavedCommandEdit.Original =
+        FGUI::Commands[static_cast<size_t>(commandIndex)].Command;
+    g_SavedCommandEdit.Draft =
+        g_SavedCommandEdit.Original;
+    g_SavedCommandEdit.FocusNextFrame = true;
+}
+
+static void BeginSavedMacroStepEdit(
+    int macroIndex, int stepIndex)
+{
+    if (macroIndex < 0 || macroIndex >=
+        static_cast<int>(FGUI::Macros.size()) ||
+        stepIndex < 0 || stepIndex >=
+        static_cast<int>(FGUI::Macros[
+            static_cast<size_t>(macroIndex)].Steps.size()))
+    {
+        return;
+    }
+
+    FinishSavedCommandEdit(false);
+    CancelBindCapture();
+    g_SavedCommandEdit.Target =
+        ESavedCommandEditTarget::MacroStep;
+    g_SavedCommandEdit.MacroIndex = macroIndex;
+    g_SavedCommandEdit.StepIndex = stepIndex;
+    g_SavedCommandEdit.Original =
+        FGUI::Macros[static_cast<size_t>(macroIndex)].Steps[
+            static_cast<size_t>(stepIndex)].Command;
+    g_SavedCommandEdit.Draft =
+        g_SavedCommandEdit.Original;
+    g_SavedCommandEdit.FocusNextFrame = true;
+}
+
+static void BeginSavedMacroDelayEdit(
+    int macroIndex, int stepIndex)
+{
+    if (macroIndex < 0 || macroIndex >=
+        static_cast<int>(FGUI::Macros.size()) ||
+        stepIndex < 0 || stepIndex >=
+        static_cast<int>(FGUI::Macros[
+            static_cast<size_t>(macroIndex)].Steps.size()))
+    {
+        return;
+    }
+
+    FinishSavedCommandEdit(false);
+    CancelBindCapture();
+    const int delayMs = FGUI::Macros[
+        static_cast<size_t>(macroIndex)].Steps[
+            static_cast<size_t>(stepIndex)].DelayMs;
+    g_SavedCommandEdit.Target =
+        ESavedCommandEditTarget::MacroDelay;
+    g_SavedCommandEdit.MacroIndex = macroIndex;
+    g_SavedCommandEdit.StepIndex = stepIndex;
+    g_SavedCommandEdit.DelayOriginal = delayMs;
+    g_SavedCommandEdit.DelayDraft = delayMs;
+    g_SavedCommandEdit.FocusNextFrame = true;
+}
+
+static void RenderSavedCommandEditor(float width)
+{
+    const bool editingDelay =
+        g_SavedCommandEdit.Target ==
+            ESavedCommandEditTarget::MacroDelay;
+    if (editingDelay)
+    {
+        ImGui::TextUnformatted("    wait");
+        ImGui::SameLine(0.f, 6.f);
+        ImGui::SetNextItemWidth((std::min)(100.f, width));
+    }
+    else
+    {
+        ImGui::SetNextItemWidth(width);
+    }
+    if (g_SavedCommandEdit.FocusNextFrame)
+    {
+        ImGui::SetKeyboardFocusHere();
+        g_SavedCommandEdit.FocusNextFrame = false;
+    }
+
+    bool submitted = false;
+    if (editingDelay)
+    {
+        ImGui::InputInt(
+            "##saved_delay_edit",
+            &g_SavedCommandEdit.DelayDraft,
+            0, 0,
+            ImGuiInputTextFlags_CharsDecimal);
+    }
+    else
+    {
+        submitted = ImGui::InputText(
+            "##saved_command_edit",
+            &g_SavedCommandEdit.Draft,
+            ImGuiInputTextFlags_EnterReturnsTrue |
+                ImGuiInputTextFlags_AutoSelectAll);
+    }
+    if (ImGui::IsItemEdited())
+        g_SavedCommandEdit.Error.clear();
+    const bool deactivated = ImGui::IsItemDeactivated();
+
+    if (editingDelay)
+    {
+        ImGui::SameLine(0.f, 6.f);
+        ImGui::TextUnformatted("ms");
+    }
+
+    if (submitted)
+        FinishSavedCommandEdit(true);
+    else if (deactivated)
+        FinishSavedCommandEdit(false);
+
+    if (g_SavedCommandEdit.Target !=
+            ESavedCommandEditTarget::None &&
+        !g_SavedCommandEdit.Error.empty())
+    {
+        ImGui::PushStyleColor(
+            ImGuiCol_Text,
+            ImVec4(1.f, 0.39f, 0.43f, 1.f));
+        ImGui::TextWrapped(
+            "%s", g_SavedCommandEdit.Error.c_str());
+        ImGui::PopStyleColor();
+    }
 }
 
 static std::string NormalizeConsoleCommand(const std::string& entered)
@@ -3166,6 +4003,7 @@ static int ConsoleInputCallback(ImGuiInputTextCallbackData* data)
                     historyCount;
             }
 
+            state.SlashPrefillActive = false;
             ReplaceConsoleInput(data, state.History[static_cast<size_t>(state.HistoryPosition)]);
         }
         else if (data->EventKey == ImGuiKey_DownArrow &&
@@ -3175,6 +4013,7 @@ static int ConsoleInputCallback(ImGuiInputTextCallbackData* data)
             state.HistoryPosition =
                 (state.HistoryPosition + 1) %
                 static_cast<int>(state.History.size());
+            state.SlashPrefillActive = false;
             ReplaceConsoleInput(
                 data,
                 state.History[
@@ -3201,10 +4040,23 @@ static int ConsoleInputCallback(ImGuiInputTextCallbackData* data)
         }
 
         if (state.CompletionPosition >= 0)
+        {
+            state.SlashPrefillActive = false;
             ReplaceConsoleInput(data, state.CompletionMatches[static_cast<size_t>(state.CompletionPosition)]);
+        }
     }
     else if (data->EventFlag == ImGuiInputTextFlags_CallbackEdit)
     {
+        // Programmatic navigation focus selects a single-line InputText on
+        // its first activation. If a character was already queued for that
+        // activation frame, keep the slash prefix that selection replaced.
+        if (state.SlashPrefillActive &&
+            data->BufTextLen > 0 &&
+            data->Buf[0] != '/')
+        {
+            data->InsertChars(0, "/");
+        }
+        state.SlashPrefillActive = false;
         if (data->BufTextLen > static_cast<int>(kMaximumConsoleCommandLength))
         {
             int validLength = static_cast<int>(kMaximumConsoleCommandLength);
@@ -3279,6 +4131,7 @@ static bool SubmitConsoleCommand()
     AppendConsoleCommandEcho(raw);
 
     g_ConsoleUi.Input.clear();
+    g_ConsoleUi.SlashPrefillActive = false;
     g_ConsoleUi.Draft.clear();
     g_ConsoleUi.HistoryPosition = -1;
     g_ConsoleUi.CompletionMatches.clear();
@@ -3380,6 +4233,8 @@ static bool RenderConsoleCommandInput(
 {
     const float clearButtonWidth = 62.f;
     const float controlSpacing = 6.f;
+    const bool slashPrefillWasActive =
+        g_ConsoleUi.SlashPrefillActive;
     ImGui::SetNextItemWidth((std::max)(
         120.f,
         ImGui::GetContentRegionAvail().x -
@@ -3391,8 +4246,23 @@ static bool RenderConsoleCommandInput(
         g_ConsoleUi.FocusInput = false;
     }
 
+    if (g_ConsoleUi.ReloadInput)
+    {
+        // InputText keeps an internal edit buffer while the console fades.
+        // Reload it before processing this frame's queued characters so both
+        // slash seeding and synthetic-slash cleanup are applied immediately.
+        const ImGuiID inputId = ImGui::GetID("##console_input");
+        if (ImGuiInputTextState* inputState =
+                ImGui::GetInputTextState(inputId))
+        {
+            inputState->ReloadUserBufAndMoveToEnd();
+        }
+        g_ConsoleUi.ReloadInput = false;
+    }
+
     const ImGuiInputTextFlags inputFlags =
         ImGuiInputTextFlags_EnterReturnsTrue |
+        ImGuiInputTextFlags_EscapeClearsAll |
         ImGuiInputTextFlags_CallbackHistory |
         ImGuiInputTextFlags_CallbackCompletion |
         ImGuiInputTextFlags_CallbackEdit;
@@ -3427,6 +4297,29 @@ static bool RenderConsoleCommandInput(
     const bool submitted = ImGui::InputText(
         "##console_input", &g_ConsoleUi.Input,
         inputFlags, ConsoleInputCallback, &g_ConsoleUi);
+    if (slashPrefillWasActive && ImGui::IsItemActivated())
+    {
+        // SetKeyboardFocusHere() activates a single-line InputText through
+        // navigation, which selects its full buffer on first use. Collapse
+        // that selection at the end so the next character is appended to the
+        // seeded slash instead of replacing it.
+        if (ImGuiInputTextState* inputState =
+                ImGui::GetInputTextState(ImGui::GetItemID()))
+        {
+            inputState->SelectAll();
+            inputState->ClearSelection();
+            inputState->CursorFollow = true;
+        }
+    }
+    if (g_ConsoleUi.RefocusAfterEscapeClear)
+    {
+        // EscapeClearsAll deactivates an already-empty InputText. Request
+        // focus on the next frame so the cleared console remains ready for
+        // typing without letting the same Escape reactivate it immediately.
+        g_ConsoleUi.RefocusAfterEscapeClear = false;
+        if (FGUI::bConsoleVisible.load(std::memory_order_acquire))
+            g_ConsoleUi.FocusInput = true;
+    }
     const ImVec2 inputMin = ImGui::GetItemRectMin();
     const ImVec2 inputMax = ImGui::GetItemRectMax();
     ImGui::PopStyleColor(6);
@@ -3847,11 +4740,15 @@ void GUI_Render()
         }
     }
 
-	// divider lines
+    // Keep the horizontal rule one pixel inside the top bar so the sidebar
+    // child cannot paint over its left segment.
     {
         ImDrawList* fdl = ImGui::GetWindowDrawList();
         const ImU32 line = IM_COL32(35, 42, 62, (int)(fade * 255.f));
-        fdl->AddLine(ImVec2(wp.x, wp.y + TopBarH), ImVec2(wp.x + W, wp.y + TopBarH), line, 1.f);
+        fdl->AddLine(
+            ImVec2(wp.x, wp.y + TopBarH - 1.f),
+            ImVec2(wp.x + W, wp.y + TopBarH - 1.f),
+            line, 1.f);
         fdl->AddLine(ImVec2(wp.x + SidebarW, wp.y + TopBarH), ImVec2(wp.x + SidebarW, wp.y + H), line, 1.f);
     }
 
@@ -3888,22 +4785,27 @@ void GUI_Render()
     ImGui::PopStyleVar();
     ImGui::PopStyleColor();
 
-    const float ContentPadX = 28.f;
-    const float ContentPadTop = 12.f;
+    if (FGUI::ActiveTab != 1)
+        FinishSavedCommandEdit(false);
+
+    const float ContentPadX = ContentHorizontalInset;
+    const float ContentPadTop = 14.f;
     const bool bCommandsTab = FGUI::ActiveTab == 1;
-    const float ContentChildW = (W - SidebarW) - ContentPadX;
+    const float ContentChildW =
+        (W - SidebarW) - ContentPadX;
     ImGui::SetCursorPos(ImVec2(SidebarW + ContentPadX, TopBarH + ContentPadTop));
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.f, 0.f, 0.f, 0.f));
     ImGui::PushStyleVar(ImGuiStyleVar_Alpha, fade);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.f, 0.f));
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.f, 10.f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.f, 6.f));
     const ImGuiWindowFlags ContentFlags = bCommandsTab ? ImGuiWindowFlags_AlwaysVerticalScrollbar : ImGuiWindowFlags_None;
     ImGui::BeginChild("##content",
         ImVec2(ContentChildW, (H - TopBarH) - ContentPadTop - 12.f), false,
         ContentFlags);
 
-    float CW = ImGui::GetContentRegionAvail().x;
-    CW -= ContentPadX;
+    float CW =
+        ImGui::GetContentRegionAvail().x -
+            SectionBodyIndent - ContentHorizontalInset;
     if (CW < 1.f)
         CW = ImGui::GetContentRegionAvail().x;
 
@@ -3912,47 +4814,35 @@ void GUI_Render()
     case 0: // main tab
     {
         SectionLabel("Host");
+        BeginSectionBody();
 
     const char* hostTypeItems[] = { "Local Host", "Remote Host" };
-    ImGui::PushItemWidth(CW);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8.f, 8.f));
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10.f, 7.f));
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.f, 6.f));
-    ImGui::Combo("##hosttype", &FGUI::HostType, hostTypeItems, 2);
-    ImGui::PopStyleVar(3);
-    ImGui::PopItemWidth();
+    const float hostControlWidth = CW;
+    LabeledCombo(
+        "Host Type", "##hosttype", &FGUI::HostType,
+        hostTypeItems, IM_ARRAYSIZE(hostTypeItems),
+        hostControlWidth);
 
     ImGui::Spacing();
 
     if (FGUI::HostType == 0)
     {
-        if (ImGui::Button("Join Local Host", ImVec2(CW, 0.f)))
+        if (ImGui::Button(
+                "Join Local Host",
+                ImVec2(hostControlWidth, 0.f)))
             JoinSelectedHost();
     }
     else
     {
-        ImGui::PushItemWidth(CW);
+        ImGui::PushItemWidth(hostControlWidth);
         ImGui::InputTextWithHint("##remoteip", "Enter IP to join", FGUI::RemoteIP, sizeof(FGUI::RemoteIP));
         ImGui::PopItemWidth();
 
-        if (std::fabs(VersionInfo.FortniteVersion - 27.11) < 0.001)
-        {
-            bool remoteDurianLegacy =
-                FGUI::bRemoteDurianLegacyReplication.load(
-                    std::memory_order_acquire);
-            if (ImGui::Checkbox(
-                    "Durian event (legacy replication)",
-                    &remoteDurianLegacy))
-            {
-                FGUI::bRemoteDurianLegacyReplication.store(
-                    remoteDurianLegacy,
-                    std::memory_order_release);
-            }
-        }
-
         ImGui::Spacing();
 
-        if (ImGui::Button("Join Remote Host", ImVec2(CW, 0.f)))
+        if (ImGui::Button(
+                "Join Remote Host",
+                ImVec2(hostControlWidth, 0.f)))
             JoinSelectedHost();
     }
 
@@ -3960,14 +4850,17 @@ void GUI_Render()
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.353f, 0.388f, 0.478f, 1.f));
     ImGui::TextWrapped("Pressing this key joins the currently selected host type.");
     ImGui::PopStyleColor();
+    EndSectionBody();
 
     if (VersionInfo.EngineVersion < 4.24 || VersionInfo.FortniteVersion < 24.30)
     {
         SectionLabel("Editing");
+        BeginSectionBody();
 
         if (VersionInfo.EngineVersion < 4.24)
         {
-            ImGui::Checkbox("Edit On Release", &FConfiguration::bEOREnabled);
+            PersistentCheckbox(
+                "Edit On Release", FConfiguration::bEOREnabled);
             ImGui::SameLine(0.f, 10.f);
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.353f, 0.388f, 0.478f, 1.f));
             ImGui::TextUnformatted("EOR");
@@ -3976,7 +4869,8 @@ void GUI_Render()
 
         if (VersionInfo.FortniteVersion < 24.30)
         {
-            ImGui::Checkbox("Reset On Release", &FConfiguration::bROREnabled);
+            PersistentCheckbox(
+                "Reset On Release", FConfiguration::bROREnabled);
             ImGui::SameLine(0.f, 10.f);
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.353f, 0.388f, 0.478f, 1.f));
             ImGui::TextUnformatted("ROR");
@@ -3985,60 +4879,129 @@ void GUI_Render()
 
         if (VersionInfo.FortniteVersion < 15.20)
         {
-            bool disablePreEdits =
-                FConfiguration::bDisablePreEdits.load(
-                    std::memory_order_acquire);
-            if (ImGui::Checkbox(
-                "Disable Pre-Edits", &disablePreEdits))
-            {
-                FConfiguration::bDisablePreEdits.store(
-                    disablePreEdits, std::memory_order_release);
-            }
+            PersistentCheckbox(
+                "Disable Pre-Edits",
+                FConfiguration::bDisablePreEdits);
+        }
+        EndSectionBody();
+    }
+
+    SectionLabel("Graphics");
+    BeginSectionBody();
+
+    PersistentAbsoluteCommandCheckbox(
+        "Mobile Builds",
+        FConfiguration::bMobileBuilds,
+        SettingCommandMobileBuilds);
+
+    PersistentAbsoluteCommandCheckbox(
+        "In-Game Fog",
+        FConfiguration::bGameplayFog,
+        SettingCommandInGameFog);
+
+    {
+        const float sliderWidth = CW;
+        int mipMapLODBias = FConfiguration::MipMapLODBias.load(
+            std::memory_order_acquire);
+        if (LabeledSliderInt(
+                "Potato Graphics", "##potatographics",
+                &mipMapLODBias, 0, 15,
+                sliderWidth))
+        {
+            std::lock_guard<std::mutex> lock(
+                g_SettingCommandMutex);
+            FConfiguration::MipMapLODBias.store(
+                mipMapLODBias, std::memory_order_release);
+            g_PendingSettingCommandMask.fetch_or(
+                SettingCommandMipMapLODBias,
+                std::memory_order_acq_rel);
         }
     }
+    EndSectionBody();
 
     if (VersionInfo.FortniteVersion < 5.00)
     {
         SectionLabel("Movement");
-        bool SprintByDefault = FConfiguration::bSprintByDefault.load(std::memory_order_acquire);
-
-        if (ImGui::Checkbox("Sprint by Default", &SprintByDefault))
+        BeginSectionBody();
+        if (PersistentCheckbox(
+                "Sprint by Default",
+                FConfiguration::bSprintByDefault))
         {
-            FConfiguration::bSprintByDefault.store(SprintByDefault, std::memory_order_release);
-            AtlasDiagnostics::WriteLine("sprint-by-default changed=%s", SprintByDefault ? "enabled" : "disabled");
+            AtlasDiagnostics::WriteLine(
+                "sprint-by-default changed=%s",
+                FConfiguration::bSprintByDefault.load(
+                    std::memory_order_acquire)
+                    ? "enabled"
+                    : "disabled");
         }
+        EndSectionBody();
     }
 
     SectionLabel("FOV");
     {
+        BeginSectionBody();
         const float ResetW = 110.f;
-        const float SliderW = CW - ResetW - ImGui::GetStyle().ItemSpacing.x;
-        ImGui::PushItemWidth(SliderW > 80.f ? SliderW : 80.f);
+        const float SliderW = (std::max)(
+            80.f,
+            CW - ResetW - ImGui::GetStyle().ItemSpacing.x);
 
-        if (ImGui::SliderInt("##fov", &FConfiguration::FOV, 1, 175))
+        int fieldOfView = FConfiguration::FOV.load(
+            std::memory_order_acquire);
+        if (LabeledSliderInt(
+                "Field of View", "##fov",
+                &fieldOfView, 1, 175, SliderW))
         {
-            char cmd[32];
-            snprintf(cmd, sizeof(cmd), "fov %d", FConfiguration::FOV);
-            Exec(cmd);
+            std::lock_guard<std::mutex> lock(
+                g_SettingCommandMutex);
+            FConfiguration::FOV.store(
+                fieldOfView, std::memory_order_release);
+            g_PendingSettingCommandMask.fetch_or(
+                SettingCommandFOV,
+                std::memory_order_acq_rel);
         }
 
-        ImGui::PopItemWidth();
         ImGui::SameLine();
         if (ImGui::Button("Reset FOV", ImVec2(ResetW, 0.f)))
         {
-            FConfiguration::FOV = 80;
-            Exec("fov");
+            std::lock_guard<std::mutex> lock(
+                g_SettingCommandMutex);
+            FConfiguration::FOV.store(
+                80, std::memory_order_release);
+            g_PendingSettingCommandMask.fetch_or(
+                SettingCommandFOV,
+                std::memory_order_acq_rel);
         }
+        EndSectionBody();
     }
 
     SectionLabel("Respawn");
-    ImGui::Checkbox("Respawns Enabled", &FConfiguration::bForceRespawns);
+    BeginSectionBody();
+    PersistentCheckbox(
+        "Respawns Enabled", FConfiguration::bForceRespawns);
+    EndSectionBody();
+
+    SectionLabel("Other");
+    BeginSectionBody();
+    if (VersionInfo.FortniteVersion <= 10.40)
+    {
+        SessionToggleCommandCheckbox(
+            "Debug Camera",
+            FConfiguration::bDebugCamera,
+            SettingCommandDebugCamera);
+    }
+
+    SessionToggleCommandCheckbox(
+        "Target Info",
+        FConfiguration::bTargetInfo,
+        SettingCommandTargetInfo);
+    EndSectionBody();
 
         break;
     }
     case 1: // Commands
     {
         SectionLabel("Commands");
+        BeginSectionBody();
 
         ImGui::PushItemWidth(CW);
         ImGui::InputTextWithHint("##commandinput", "UE Console Command", FGUI::CommandInput, sizeof(FGUI::CommandInput));
@@ -4169,8 +5132,9 @@ void GUI_Render()
             }
         }
 
-        ImGui::Spacing();
+        EndSectionBody();
         SectionLabel("Saved");
+        BeginSectionBody();
 
         if (FGUI::Commands.empty() && FGUI::Macros.empty())
         {
@@ -4185,9 +5149,27 @@ void GUI_Render()
                 auto& command = FGUI::Commands[i];
                 ImGui::PushID(i);
 
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.847f, 0.878f, 0.941f, 1.f));
-                ImGui::TextWrapped("%s", command.Command.c_str());
-                ImGui::PopStyleColor();
+                if (IsEditingSavedCommand(i))
+                {
+                    RenderSavedCommandEditor(CW);
+                }
+                else
+                {
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.847f, 0.878f, 0.941f, 1.f));
+                    ImGui::TextWrapped("%s", command.Command.c_str());
+                    ImGui::PopStyleColor();
+
+                    if (ImGui::IsItemHovered())
+                    {
+                        ImGui::SetMouseCursor(
+                            ImGuiMouseCursor_TextInput);
+                        if (ImGui::IsMouseDoubleClicked(
+                                ImGuiMouseButton_Left))
+                        {
+                            BeginSavedCommandEdit(i);
+                        }
+                    }
+                }
 
                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.353f, 0.388f, 0.478f, 1.f));
                 ImGui::Text("Key: %s", BindName(command.VK));
@@ -4196,6 +5178,7 @@ void GUI_Render()
                 const float ButtonW = (CW - ImGui::GetStyle().ItemSpacing.x * 2.f) / 3.f;
                 if (ImGui::Button("Run", ImVec2(ButtonW, 0.f)))
                 {
+                    FinishSavedCommandEdit(false);
                     if (Exec(command.Command.c_str()))
                         AppendConsoleCommandEcho(
                             command.Command);
@@ -4212,6 +5195,7 @@ void GUI_Render()
 
                 if (ImGui::Button(bindLabel, ImVec2(ButtonW, 0.f)))
                 {
+                    FinishSavedCommandEdit(false);
                     if (FGUI::RebindingCommandIndex == i)
                     {
                         FGUI::RebindingCommandIndex = -2;
@@ -4236,6 +5220,10 @@ void GUI_Render()
 
                 if (ImGui::Button("Delete", ImVec2(ButtonW, 0.f)))
                 {
+                    if (IsEditingSavedCommand(i))
+                        CancelSavedCommandEdit();
+                    else
+                        FinishSavedCommandEdit(false);
                     FGUI::Commands.erase(FGUI::Commands.begin() + i);
                     FGUI::RebindingCommandIndex = -2;
                     FGUI::SaveCommands();
@@ -4255,15 +5243,69 @@ void GUI_Render()
 
                 for (size_t stepIndex = 0; stepIndex < macro.Steps.size(); stepIndex++)
                 {
-                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.847f, 0.878f, 0.941f, 1.f));
-                    ImGui::TextWrapped("%s", macro.Steps[stepIndex].Command.c_str());
-                    ImGui::PopStyleColor();
+                    ImGui::PushID(static_cast<int>(stepIndex));
+                    if (IsEditingSavedMacroStep(
+                            i, static_cast<int>(stepIndex)))
+                    {
+                        RenderSavedCommandEditor(CW);
+                    }
+                    else
+                    {
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.847f, 0.878f, 0.941f, 1.f));
+                        ImGui::TextWrapped("%s", macro.Steps[stepIndex].Command.c_str());
+                        ImGui::PopStyleColor();
+
+                        if (ImGui::IsItemHovered())
+                        {
+                            ImGui::SetMouseCursor(
+                                ImGuiMouseCursor_TextInput);
+                            if (ImGui::IsMouseDoubleClicked(
+                                    ImGuiMouseButton_Left))
+                            {
+                                BeginSavedMacroStepEdit(
+                                    i,
+                                    static_cast<int>(stepIndex));
+                            }
+                        }
+                    }
+                    ImGui::PopID();
 
                     if (stepIndex + 1 < macro.Steps.size())
                     {
-                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.353f, 0.388f, 0.478f, 1.f));
-                        ImGui::Text("    wait %d ms", macro.Steps[stepIndex].DelayMs);
-                        ImGui::PopStyleColor();
+                        ImGui::PushID(
+                            static_cast<int>(stepIndex));
+                        if (IsEditingSavedMacroDelay(
+                                i,
+                                static_cast<int>(stepIndex)))
+                        {
+                            RenderSavedCommandEditor(CW);
+                        }
+                        else
+                        {
+                            ImGui::PushStyleColor(
+                                ImGuiCol_Text,
+                                ImVec4(
+                                    0.353f, 0.388f,
+                                    0.478f, 1.f));
+                            ImGui::Text(
+                                "    wait %d ms",
+                                macro.Steps[stepIndex].DelayMs);
+                            ImGui::PopStyleColor();
+
+                            if (ImGui::IsItemHovered())
+                            {
+                                ImGui::SetMouseCursor(
+                                    ImGuiMouseCursor_TextInput);
+                                if (ImGui::IsMouseDoubleClicked(
+                                        ImGuiMouseButton_Left))
+                                {
+                                    BeginSavedMacroDelayEdit(
+                                        i,
+                                        static_cast<int>(stepIndex));
+                                }
+                            }
+                        }
+                        ImGui::PopID();
                     }
                 }
 
@@ -4273,7 +5315,10 @@ void GUI_Render()
 
                 const float MacroButtonW = (CW - ImGui::GetStyle().ItemSpacing.x * 2.f) / 3.f;
                 if (ImGui::Button("Run", ImVec2(MacroButtonW, 0.f)))
+                {
+                    FinishSavedCommandEdit(false);
                     QueueMacro(macro);
+                }
                 ImGui::SameLine();
 
                 char macroBindLabel[64];
@@ -4286,6 +5331,7 @@ void GUI_Render()
 
                 if (ImGui::Button(macroBindLabel, ImVec2(MacroButtonW, 0.f)))
                 {
+                    FinishSavedCommandEdit(false);
                     if (FGUI::RebindingMacroIndex == i)
                     {
                         FGUI::RebindingMacroIndex = -2;
@@ -4310,6 +5356,18 @@ void GUI_Render()
 
                 if (ImGui::Button("Delete", ImVec2(MacroButtonW, 0.f)))
                 {
+                    if ((g_SavedCommandEdit.Target ==
+                            ESavedCommandEditTarget::MacroStep ||
+                         g_SavedCommandEdit.Target ==
+                            ESavedCommandEditTarget::MacroDelay) &&
+                        g_SavedCommandEdit.MacroIndex == i)
+                    {
+                        CancelSavedCommandEdit();
+                    }
+                    else
+                    {
+                        FinishSavedCommandEdit(false);
+                    }
                     FGUI::Macros.erase(FGUI::Macros.begin() + i);
                     FGUI::RebindingMacroIndex = -2;
                     FGUI::SaveMacros();
@@ -4322,17 +5380,23 @@ void GUI_Render()
             }
             ImGui::PopID();
         }
+        EndSectionBody();
 
         break;
     }
     case 2: // Config
     {
-    SectionLabel("Console Style");
+    SectionLabel("Preferences");
+    BeginSectionBody();
     int consoleMode =
         FConfiguration::ConsoleMode.load(std::memory_order_acquire);
-    ImGui::SetNextItemWidth(CW);
-    if (ImGui::Combo("##console_mode", &consoleMode,
-        "ATLAS Console\0Original UE Console\0"))
+    const char* consoleModeItems[] = {
+        "ATLAS Console", "Original UE Console"
+    };
+    if (LabeledCombo(
+            "Console Style", "##console_mode", &consoleMode,
+            consoleModeItems, IM_ARRAYSIZE(consoleModeItems),
+            CW))
     {
         consoleMode = HotkeyPersist::SanitizeConsoleMode(consoleMode);
         FConfiguration::ConsoleMode.store(
@@ -4346,7 +5410,12 @@ void GUI_Render()
         if (consoleMode == static_cast<int>(EConsoleMode::Unreal))
             CloseConsoleSurface();
     }
+    PersistentCheckbox(
+        "Slash Key", FConfiguration::bSlashKeyEnabled);
+    TogglePreferencePersistenceCheckbox();
+    EndSectionBody();
     SectionLabel("Hotkeys");
+    BeginSectionBody();
     if (FGUI::bRebinding)
     {
         ImGui::PushStyleColor(ImGuiCol_Text, Accent());
@@ -4357,7 +5426,7 @@ void GUI_Render()
     else
     {
         char btnLabel[64];
-        snprintf(btnLabel, sizeof(btnLabel), "Rebind Menu Key      [%s]", VKName(FGUI::HotkeyVK));
+        snprintf(btnLabel, sizeof(btnLabel), "Rebind Menu Key [%s]", VKName(FGUI::HotkeyVK));
         if (ImGui::Button(btnLabel, ImVec2(CW, 0.f)))
         {
             FGUI::bRebinding = true;
@@ -4378,7 +5447,7 @@ void GUI_Render()
     else
     {
         char joinBtnLabel[64];
-        snprintf(joinBtnLabel, sizeof(joinBtnLabel), "Rebind Join Key   [%s]", VKName(FGUI::JoinHotkeyVK));
+        snprintf(joinBtnLabel, sizeof(joinBtnLabel), "Rebind Join Key [%s]", VKName(FGUI::JoinHotkeyVK));
         if (ImGui::Button(joinBtnLabel, ImVec2(CW, 0.f)))
         {
             FGUI::bRebindingJoin = true;
@@ -4402,6 +5471,7 @@ void GUI_Render()
         FGUI::ResetAll();
         CloseConsoleSurface();
     }
+    EndSectionBody();
 
         ImGui::Dummy(ImVec2(0.f, 8.f));
         break;

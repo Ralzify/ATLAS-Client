@@ -10,6 +10,7 @@
 #include <vector>
 
 void GUI_Init();
+void GUI_LoadUserPreferences();
 void GUI_Render();
 void GUI_HandleInput(bool windowActive);
 void GUI_SetGameThreadDispatcherReady(bool ready);
@@ -42,7 +43,6 @@ struct FGUI
 
     static inline int HostType = 0; // 0 = Local Host, 1 = Remote Host
     static inline char RemoteIP[64] = "";
-    static inline std::atomic_bool bRemoteDurianLegacyReplication = false;
 
     static inline std::atomic_int JoinHotkeyVK = VK_F5;
     static inline bool bRebindingJoin = false;

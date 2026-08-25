@@ -52,6 +52,7 @@ static std::array<std::atomic_uint8_t, 0xFF> g_LegacyInputOwners{};
 static std::array<std::atomic_uint8_t, 0xFF> g_RawInputOwners{};
 static std::array<std::atomic_bool, 0xFF> g_ImGuiLegacyDown{};
 static std::atomic_uint g_SuppressedConsoleScanCode = 0;
+static std::atomic_uint g_SuppressedSlashScanCode = 0;
 static std::atomic_bool g_TranslatedF8Down = false;
 
 static std::atomic_bool g_DXHookInstalled = false;
@@ -399,7 +400,6 @@ namespace
 
 bool ATLAS_PrepareReplicationForOpen(
     const char* Command,
-    bool bRemoteDurianLegacy,
     wchar_t* Error,
     size_t ErrorCapacity)
 {
@@ -423,7 +423,7 @@ bool ATLAS_PrepareReplicationForOpen(
         }
         else
         {
-            bUseIris = !bRemoteDurianLegacy;
+            bUseIris = true;
         }
     }
 
@@ -1116,6 +1116,11 @@ static void ReconcileReleasedInputOwners()
         g_TranslatedF8Down.store(
             false, std::memory_order_release);
     }
+    if ((GetAsyncKeyState(VK_OEM_2) & 0x8000) == 0)
+    {
+        g_SuppressedSlashScanCode.store(
+            0u, std::memory_order_release);
+    }
 }
 
 static void ClearImGuiMouseOwnership(HWND window)
@@ -1388,6 +1393,50 @@ static LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
             static_cast<int>(wParam) == VK_OEM_3))
     {
         g_SuppressedConsoleScanCode.store(0u, std::memory_order_release);
+    }
+
+    // Slash opens ATLAS on the next Present. Suppress every translated
+    // character from that physical press until key-up so it cannot leak into
+    // Fortnite before the console opens or append a second slash afterward.
+    const bool initialSlashConsoleKeyDown =
+        atlasWindow && foregroundGameWindow &&
+        !GUI_IsOverlayVisible() &&
+        GUI_IsOwnedHotkey(VK_OEM_2) &&
+        (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) &&
+        static_cast<int>(wParam) == VK_OEM_2 &&
+        (static_cast<ULONG_PTR>(lParam) & (1ull << 30)) == 0;
+    if (initialSlashConsoleKeyDown)
+    {
+        const unsigned int scanCode =
+            static_cast<unsigned int>(
+                (static_cast<ULONG_PTR>(lParam) >> 16) & 0xFFu);
+        g_SuppressedSlashScanCode.store(
+            scanCode + 1u, std::memory_order_release);
+    }
+
+    if (atlasWindow &&
+        (msg == WM_CHAR || msg == WM_SYSCHAR ||
+            msg == WM_DEADCHAR || msg == WM_SYSDEADCHAR))
+    {
+        const unsigned int pendingScanCode =
+            g_SuppressedSlashScanCode.load(
+                std::memory_order_acquire);
+        const unsigned int characterScanCode =
+            static_cast<unsigned int>(
+                (static_cast<ULONG_PTR>(lParam) >> 16) & 0xFFu) + 1u;
+        if (pendingScanCode != 0 &&
+            pendingScanCode == characterScanCode)
+        {
+            return 0;
+        }
+    }
+
+    if (losingFocus ||
+        ((msg == WM_KEYUP || msg == WM_SYSKEYUP) &&
+            static_cast<int>(wParam) == VK_OEM_2))
+    {
+        g_SuppressedSlashScanCode.store(
+            0u, std::memory_order_release);
     }
 
     if (atlasWindow && (foregroundGameWindow || focusLifecycleMessage))
@@ -1833,6 +1882,11 @@ void Main()
         consoleMode == static_cast<int>(EConsoleMode::Unreal)
             ? "original-unreal"
             : "atlas");
+
+    // Load the complete preference snapshot before the render hook can make
+    // the menu interactive. This prevents early UI changes from saving over
+    // preferences that Client::Init has not seen yet.
+    GUI_LoadUserPreferences();
 
     std::thread(InstallDXHookThread).detach();
 
