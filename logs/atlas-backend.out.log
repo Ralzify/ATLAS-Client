@@ -1,0 +1,2 @@
+[2026-09-02T01:08:47.112Z] [DEBUG] [SDK] /sdk/v1/product/prod-fn → auth=http://127.0.0.1:3551, mode=local-rewrite, xmpp=off (client 127.0.0.1, host=127.0.0.1, ua=EOS-SDK/1.16.3210 Fortnite/++Fortnite+Release-32.11-CL-38202817)
+[2026-09-02T01:11:52.855Z] [DEBUG] [SDK] /sdk/v1/product/prod-fn → auth=http://127.0.0.1:3551, mode=local-rewrite, xmpp=off (client 127.0.0.1, host=127.0.0.1, ua=EOS-SDK/1.16.3210 Fortnite/++Fortnite+Release-32.11-CL-38202817)

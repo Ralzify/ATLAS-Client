@@ -25,4 +25,5 @@ public:
     static bool IsConsoleCaptureReady();
     static bool HasReceivedServerCommandList();
     static uint64_t GetConsoleSessionGeneration();
+    static bool IsFrontendActive();
 };

@@ -24,6 +24,7 @@ struct FConfiguration
 	static inline std::atomic_bool bROREnabled = true;
 	static inline std::atomic_bool bMobileBuilds = false;
 	static inline std::atomic_bool bGameplayFog = true;
+	static inline std::atomic_bool bFirstPerson = false;
 	static inline std::atomic_bool bDebugCamera = false;
 	static inline std::atomic_bool bTargetInfo = false;
 	static inline std::atomic_bool bDisablePreEdits = true;

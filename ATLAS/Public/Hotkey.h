@@ -50,6 +50,7 @@ namespace HotkeyPersist
         bool DisablePreEdits = true;
         bool MobileBuilds = false;
         bool InGameFog = true;
+        bool FirstPerson = false;
         bool SprintByDefault = true;
         bool RespawnsEnabled = true;
     };
@@ -466,6 +467,8 @@ namespace HotkeyPersist
             object, "mobileBuilds", preferences.MobileBuilds);
         preferences.InGameFog = ParseBoolField(
             object, "inGameFog", preferences.InGameFog);
+        preferences.FirstPerson = ParseBoolField(
+            object, "firstPerson", preferences.FirstPerson);
         preferences.SprintByDefault = ParseBoolField(
             object, "sprintByDefault", preferences.SprintByDefault);
         preferences.RespawnsEnabled = ParseBoolField(
@@ -684,6 +687,7 @@ namespace HotkeyPersist
                 f << "    \"disablePreEdits\": " << boolean(preferences->DisablePreEdits) << ",\n";
                 f << "    \"mobileBuilds\": " << boolean(preferences->MobileBuilds) << ",\n";
                 f << "    \"inGameFog\": " << boolean(preferences->InGameFog) << ",\n";
+                f << "    \"firstPerson\": " << boolean(preferences->FirstPerson) << ",\n";
                 f << "    \"sprintByDefault\": " << boolean(preferences->SprintByDefault) << ",\n";
                 f << "    \"respawnsEnabled\": " << boolean(preferences->RespawnsEnabled) << "\n";
                 f << "  }";

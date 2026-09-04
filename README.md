@@ -15,6 +15,17 @@ ATLAS Console is a lightweight in-game overlay and client mod for OGFN private s
 ## Features
 
 
+### Live Asset Hotfixes
+
+- Compatible backends can update CurveTable and DataTable rows while the game is running. ATLAS performs a lightweight title-file check, then applies one bounded native delta when Unreal accepts different `DefaultGame.ini` bytes. A first, untracked, or unsupported changed revision may require one stock full pass to establish safe planner state.
+
+- Byte-identical checks skip the native table-row walk. Existing spawned/equipped objects are not force-refreshed and may require their normal respawn or reinitialization path before a changed table value is visible.
+
+- Turning a toggle off is observed as removal of its exact directive. ATLAS restores a CurveTable value when it captured that value before a proven absent-to-present live change; directives already active when the first safe revision was established have no trustworthy native baseline. Curve restoration reproduces the sampled value, not key tangents or interpolation metadata. DataTable additions and edits apply to subsequently initialized objects, but a removed DataTable directive without an exact trusted baseline remains in memory until the game reloads it or restarts.
+
+- The accepted `DefaultGame.ini` safety limit is **8 MiB** (`8 * 1024 * 1024` bytes). ATLAS does not scan EMS files, replay player inventories, export whole tables on the game thread, or guess missing native values. If the required native capabilities cannot be resolved safely, added polling stays disabled and stock behavior is preserved.
+
+
 
 ### Overlay
 
@@ -80,7 +91,7 @@ ATLAS Console is a lightweight in-game overlay and client mod for OGFN private s
 
 - **FOV Slider** — Set field of view from 1° to 175° via `fov <value>`. Right-click the slider to type an exact clamped value.
 
-- **Other Tools** — Toggle target information on any supported build, plus the debug camera through Fortnite 10.40.
+- **Other Tools** — First Person Camera switches with `camera first` / `camera default`, keeps the local Body and weapon-animation source rendered for smooth arms and held items, and hides the other local-player components. Original component visibility is restored when disabled. Target Info is available on supported builds, with Debug Camera through Fortnite 10.40.
 
 - **Resolution Dropdown** — Switch between 1920×1080, 1720×1080 (stretched res), and 1280×720. Requires fullscreen.
 
@@ -94,7 +105,7 @@ ATLAS Console is a lightweight in-game overlay and client mod for OGFN private s
 
 - **Console Keys** — Uses F8 and Unreal's native backtick/tilde binding for the three-state console cycle; `/` opens the ATLAS command field only when ATLAS Console and Slash Key are enabled.
 
-- **Saved Toggles** — With Save Toggle Preferences enabled, editing, graphics, movement, respawn, and Slash Key preferences are written immediately and restored on the next inject. When disabled, those settings use defaults on each inject and changes last only for the current session. Debug Camera and Target Info are always session-only.
+- **Saved Toggles** — With Save Toggle Preferences enabled, editing, graphics, movement, respawn, First Person Camera, and Slash Key preferences are written immediately and restored on the next inject. When disabled, those settings use defaults on each inject and changes last only for the current session. Debug Camera and Target Info are always session-only.
 
 - **Reset All** — Restores console style, hotkeys, toggle preferences, graphics sliders, FOV, host fields, commands, and macros to their defaults and reapplies command-backed defaults in game.
 
@@ -241,6 +252,7 @@ Example file:
     "disablePreEdits": true,
     "mobileBuilds": false,
     "inGameFog": true,
+    "firstPerson": false,
     "sprintByDefault": true,
     "respawnsEnabled": true
   },

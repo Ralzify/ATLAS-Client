@@ -4,6 +4,7 @@
 #include "../Public/Diagnostics.h"
 #include "../Public/Finders.h"
 #include "../Public/GUI.h"
+#include "../Public/HotfixReload.h"
 #include <atomic>
 #include <array>
 #include <mutex>
@@ -216,6 +217,181 @@ namespace
             "replication-policy applied mode=%s sites=%zu",
             bUseIris ? "Iris" : "GenericLegacy",
             IrisPatchSites.size());
+        return true;
+    }
+
+    bool InstallPrivateMatchmakingSecurityGateCompatibility()
+    {
+        // Some releases place an App Environment Security result directly in
+        // the matchmaking state machine. An offline launcher cannot produce
+        // Epic's signed per-launch attestation, so that result can fail before
+        // the client makes any request to the configured matchmaking service.
+        //
+        // Keep this capability-scoped: require the complete affected call-site
+        // shape, require exactly one match, and verify that its failure branch
+        // resolves to the expected reason before changing a single opcode.
+        constexpr int16_t Wildcard = -1;
+        constexpr std::array<int16_t, 25> AppEsCallSite = {
+            0xE8, Wildcard, Wildcard, Wildcard, Wildcard,
+            0x48, 0x8D, 0x4C, 0x24, 0x40,
+            0x40, 0x8A, 0xF0,
+            0xE8, Wildcard, Wildcard, Wildcard, Wildcard,
+            0x80, 0x3D, Wildcard, Wildcard, Wildcard, Wildcard, 0x06
+        };
+
+        auto TextSection = Memcury::PE::Section::GetSection(".text");
+        const auto TextBytes = TextSection.GetSectionStart()
+            .GetAs<const uint8_t*>();
+        const size_t TextSize = TextSection.GetSectionSize();
+        if (!TextBytes || TextSize < AppEsCallSite.size())
+            return false;
+
+        uintptr_t Match = 0;
+        size_t MatchCount = 0;
+        for (size_t Index = 0;
+             Index + AppEsCallSite.size() <= TextSize;
+             ++Index)
+        {
+            bool bMatches = true;
+            for (size_t ByteIndex = 0;
+                 ByteIndex < AppEsCallSite.size();
+                 ++ByteIndex)
+            {
+                const int16_t Expected = AppEsCallSite[ByteIndex];
+                if (Expected != Wildcard &&
+                    TextBytes[Index + ByteIndex] !=
+                        static_cast<uint8_t>(Expected))
+                {
+                    bMatches = false;
+                    break;
+                }
+            }
+
+            if (!bMatches)
+                continue;
+
+            Match = reinterpret_cast<uintptr_t>(TextBytes + Index);
+            if (++MatchCount > 1)
+                break;
+        }
+
+        if (MatchCount == 0)
+            return false;
+        if (MatchCount != 1)
+        {
+            AtlasDiagnostics::WriteLine(
+                "appes-matchmaking compatibility=rejected matches=%zu",
+                MatchCount);
+            return false;
+        }
+
+        constexpr size_t ResultBranchOffset = 0x4D;
+        constexpr size_t FailureReasonLeaOffset = 0x4F;
+        auto ResultBranch = reinterpret_cast<uint8_t*>(
+            Match + ResultBranchOffset);
+        auto FailureReasonLea = reinterpret_cast<uint8_t*>(
+            Match + FailureReasonLeaOffset);
+        const bool bExpectedBranch =
+            Match + FailureReasonLeaOffset + 7 <=
+                reinterpret_cast<uintptr_t>(TextBytes) + TextSize &&
+            ResultBranch[0] == 0x75 &&
+            ResultBranch[1] == 0x1C &&
+            FailureReasonLea[0] == 0x48 &&
+            FailureReasonLea[1] == 0x8D &&
+            FailureReasonLea[2] == 0x15;
+        if (!bExpectedBranch)
+        {
+            AtlasDiagnostics::WriteLine(
+                "appes-matchmaking compatibility=rejected branch-shape");
+            return false;
+        }
+
+        const auto FailureReason =
+            Memcury::PE::Address(FailureReasonLea)
+                .RelativeOffset(3)
+                .GetAs<const wchar_t*>();
+        auto RdataSection =
+            Memcury::PE::Section::GetSection(".rdata");
+        const auto RdataBytes = RdataSection.GetSectionStart()
+            .GetAs<const uint8_t*>();
+        const size_t RdataSize = RdataSection.GetSectionSize();
+        constexpr wchar_t ExpectedFailureReason[] =
+            L"Failed Security Checks";
+        const uintptr_t FailureReasonAddress =
+            reinterpret_cast<uintptr_t>(FailureReason);
+        const uintptr_t RdataAddress =
+            reinterpret_cast<uintptr_t>(RdataBytes);
+        const bool bFailureReasonInBounds =
+            FailureReason &&
+            RdataBytes &&
+            RdataSize >= sizeof(ExpectedFailureReason) &&
+            FailureReasonAddress >= RdataAddress &&
+            FailureReasonAddress - RdataAddress <=
+                RdataSize - sizeof(ExpectedFailureReason);
+        if (!bFailureReasonInBounds ||
+            memcmp(
+                FailureReason,
+                ExpectedFailureReason,
+                sizeof(ExpectedFailureReason)) != 0)
+        {
+            AtlasDiagnostics::WriteLine(
+                "appes-matchmaking compatibility=rejected failure-reason");
+            return false;
+        }
+
+        const uintptr_t AppEsCheck =
+            Memcury::PE::Address(Match)
+                .RelativeOffset(1)
+                .Get();
+        constexpr size_t AppEsFailureTestOffset = 0x3C;
+        constexpr size_t AppEsFailureBranchOffset = 0x43;
+        constexpr std::array<uint8_t, 9> AppEsFailureTest = {
+            0x44, 0x84, 0x80, 0x30, 0x01, 0x00, 0x00, 0x74, 0x49
+        };
+        const uintptr_t TextStart =
+            reinterpret_cast<uintptr_t>(TextBytes);
+        const uintptr_t TextEnd = TextStart + TextSize;
+        if (AppEsCheck < TextStart ||
+            AppEsCheck + AppEsFailureTestOffset +
+                    AppEsFailureTest.size() > TextEnd ||
+            memcmp(
+                reinterpret_cast<const void*>(
+                    AppEsCheck + AppEsFailureTestOffset),
+                AppEsFailureTest.data(),
+                AppEsFailureTest.size()) != 0)
+        {
+            AtlasDiagnostics::WriteLine(
+                "appes-matchmaking compatibility=rejected check-shape");
+            return false;
+        }
+
+        auto FailureBranch = reinterpret_cast<uint8_t*>(
+            AppEsCheck + AppEsFailureBranchOffset);
+
+        DWORD PreviousProtection = 0;
+        if (!VirtualProtect(
+                FailureBranch, 1, PAGE_EXECUTE_READWRITE,
+                &PreviousProtection))
+        {
+            AtlasDiagnostics::WriteLine(
+                "appes-matchmaking compatibility=failed protection");
+            return false;
+        }
+
+        // Skip only the unverified-launch failure path before it emits code
+        // 2:0 or requests process exit. The remainder of AppES still runs and
+        // reports its real result to the matchmaking state machine.
+        FailureBranch[0] = 0xEB;
+        DWORD RestoredProtection = 0;
+        VirtualProtect(
+            FailureBranch, 1, PreviousProtection,
+            &RestoredProtection);
+        FlushInstructionCache(
+            GetCurrentProcess(), FailureBranch, 1);
+        AtlasDiagnostics::WriteLine(
+            "appes-matchmaking compatibility=applied site=%p version=%.2f",
+            static_cast<void*>(FailureBranch),
+            VersionInfo.FortniteVersion);
         return true;
     }
 
@@ -1858,6 +2034,76 @@ static void InstallDXHookThread()
         Sleep(250);
 }
 
+static bool EnableTournamentNotificationGate()
+{
+    auto RuntimeOptions = DefaultObjImpl("FortRuntimeOptions");
+    if (!RuntimeOptions)
+    {
+        AtlasDiagnostics::WriteLine(
+            "tournament-notification-gate runtime-options=unavailable");
+        return false;
+    }
+
+    __try
+    {
+        constexpr uint64_t BoolPropertyCastFlag = 0x20000;
+        const auto EnableOption = [&](const char* PropertyName) -> bool
+        {
+            const auto Property = RuntimeOptions->GetProperty(
+                PropertyName, BoolPropertyCastFlag);
+            if (!Property || !RuntimeOptions->Class)
+            {
+                AtlasDiagnostics::WriteLine(
+                    "tournament-notification-gate option=%s property=unavailable",
+                    PropertyName);
+                return false;
+            }
+
+            const uint32 Offset = GetFromOffset<uint32>(
+                Property, Offsets::Offset_Internal);
+            const uint8 FieldMask = Property->GetFieldMask();
+            const int32 PropertiesSize =
+                RuntimeOptions->Class->GetPropertiesSize();
+            if (Offset >= static_cast<uint32>(PropertiesSize) ||
+                FieldMask == 0)
+            {
+                AtlasDiagnostics::WriteLine(
+                    "tournament-notification-gate option=%s schema-rejected offset=%u mask=0x%02x size=%d",
+                    PropertyName,
+                    Offset,
+                    static_cast<unsigned>(FieldMask),
+                    PropertiesSize);
+                return false;
+            }
+
+            auto& Storage = GetFromOffset<uint8>(RuntimeOptions, Offset);
+            const bool Previous = (Storage & FieldMask) != 0;
+            Storage |= FieldMask;
+            const bool Enabled = (Storage & FieldMask) != 0;
+            AtlasDiagnostics::WriteLine(
+                "tournament-notification-gate option=%s previous=%d enabled=%d offset=%u mask=0x%02x",
+                PropertyName,
+                Previous ? 1 : 0,
+                Enabled ? 1 : 0,
+                Offset,
+                static_cast<unsigned>(FieldMask));
+            return Enabled;
+        };
+
+        const bool IgnoreTournamentCheck = EnableOption(
+            "bClientIgnoreIsTournamentCheck");
+        const bool UseServerPlacementNotifications = EnableOption(
+            "bUseServerTournamentPlacementNotifications");
+        return IgnoreTournamentCheck || UseServerPlacementNotifications;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        AtlasDiagnostics::WriteLine(
+            "tournament-notification-gate reflection-faulted");
+        return false;
+    }
+}
+
 void Main()
 {
     // ATLAS owns detached client/render threads and live hooks. Pinning keeps
@@ -1892,6 +2138,20 @@ void Main()
 
     SDK::Init();
 
+    if (!headlessHost)
+        InstallPrivateMatchmakingSecurityGateCompatibility();
+
+    // Install the lightweight payload observer before client initialization so
+    // a normal startup pass can seed the applied-payload identity when available.
+    AtlasHotfixReload::InstallEarlyHook();
+
+    // Epic's placement/stat RPC consumers normally require a live tournament
+    // flag on the local client. Private Arena sessions have a valid event and
+    // window but do not run Epic matchmaking, so enable the intended runtime
+    // escape hatch when that reflected option exists. Property discovery keeps
+    // this release-adaptive and fails closed on clients with a different ABI.
+    EnableTournamentNotificationGate();
+
     if (VersionInfo.EngineVersion >= 5.0)
     {
         auto RuntimeOptions = DefaultObjImpl("FortRuntimeOptions");
@@ -1919,17 +2179,15 @@ void Main()
         UKismetSystemLibrary::ExecuteConsoleCommand(UWorld::GetWorld(), FString(L"log LogIrisBridge None"), nullptr);
 
         std::lock_guard<std::mutex> Lock(IrisPolicyMutex);
-        IrisCVar = FindCVar<uint32_t>(
-            L"net.Iris.UseIrisReplication");
-        if (IrisCVar)
-        {
-            CaptureIrisPatchSites(
-                reinterpret_cast<uintptr_t>(IrisCVar));
-        }
-        else
+        // Matchmaking travel does not pass through the manual `open` command
+        // interceptor. Apply the configured transport while the client is
+        // initializing so its first PendingNetDriver agrees with the listen
+        // server. The open interceptor can still restore GenericLegacy later
+        // when a 27.11 loopback transport manifest explicitly requests it.
+        if (!ApplyIrisPolicyLocked(true))
         {
             AtlasDiagnostics::WriteLine(
-                "replication-policy prepare-failed cvar=null");
+                "replication-policy startup-apply-failed");
         }
     }
 

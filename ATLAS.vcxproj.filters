@@ -111,7 +111,37 @@
     <ClInclude Include="ATLAS\Public\GUI.h">
       <Filter>ATLAS\Public</Filter>
     </ClInclude>
+    <ClInclude Include="ATLAS\Public\JoinRequestPolicy.h">
+      <Filter>ATLAS\Public</Filter>
+    </ClInclude>
+    <ClInclude Include="ATLAS\Public\AssetHotfixBaselineSampler.h">
+      <Filter>ATLAS\Public</Filter>
+    </ClInclude>
+    <ClInclude Include="ATLAS\Public\AssetHotfixRevisionPlanner.h">
+      <Filter>ATLAS\Public</Filter>
+    </ClInclude>
+    <ClInclude Include="ATLAS\Public\HotfixReload.h">
+      <Filter>ATLAS\Public</Filter>
+    </ClInclude>
     <ClInclude Include="ATLAS\Public\LoadoutTelemetry.h">
+      <Filter>ATLAS\Public</Filter>
+    </ClInclude>
+    <ClInclude Include="ATLAS\Public\PlaylistHudPatchPolicy.h">
+      <Filter>ATLAS\Public</Filter>
+    </ClInclude>
+    <ClInclude Include="ATLAS\Public\ArenaHudOwnershipPolicy.h">
+      <Filter>ATLAS\Public</Filter>
+    </ClInclude>
+    <ClInclude Include="ATLAS\Public\ArenaSessionBridgePolicy.h">
+      <Filter>ATLAS\Public</Filter>
+    </ClInclude>
+    <ClInclude Include="ATLAS\Public\ArenaNativeVisualCorrelationPolicy.h">
+      <Filter>ATLAS\Public</Filter>
+    </ClInclude>
+    <ClInclude Include="ATLAS\Public\ArenaVisualTracePolicy.h">
+      <Filter>ATLAS\Public</Filter>
+    </ClInclude>
+    <ClInclude Include="ATLAS\Public\TournamentRefreshPolicy.h">
       <Filter>ATLAS\Public</Filter>
     </ClInclude>
     <ClInclude Include="ATLAS\ImGui\stb_image.h">
@@ -159,6 +189,15 @@
       <Filter>ATLAS\ImGui</Filter>
     </ClCompile>
     <ClCompile Include="ATLAS\Private\GUI.cpp">
+      <Filter>ATLAS\Private</Filter>
+    </ClCompile>
+    <ClCompile Include="ATLAS\Private\AssetHotfixBaselineSampler.cpp">
+      <Filter>ATLAS\Private</Filter>
+    </ClCompile>
+    <ClCompile Include="ATLAS\Private\AssetHotfixRevisionPlanner.cpp">
+      <Filter>ATLAS\Private</Filter>
+    </ClCompile>
+    <ClCompile Include="ATLAS\Private\HotfixReload.cpp">
       <Filter>ATLAS\Private</Filter>
     </ClCompile>
     <ClCompile Include="ATLAS\Private\LoadoutTelemetry.cpp">

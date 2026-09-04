@@ -17,8 +17,11 @@
 #include <cmath>
 #include <deque>
 #include <mutex>
+#include <Shellapi.h>
 #include <unordered_set>
 #include <vector>
+
+#pragma comment(lib, "Shell32.lib")
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_ONLY_PNG
@@ -521,6 +524,9 @@ static HotkeyPersist::UserPreferences CaptureUserPreferences()
     preferences.InGameFog =
         FConfiguration::bGameplayFog.load(
             std::memory_order_acquire);
+    preferences.FirstPerson =
+        FConfiguration::bFirstPerson.load(
+            std::memory_order_acquire);
     preferences.SprintByDefault =
         FConfiguration::bSprintByDefault.load(
             std::memory_order_acquire);
@@ -548,6 +554,8 @@ static void ApplyUserPreferences(
         preferences.MobileBuilds, std::memory_order_release);
     FConfiguration::bGameplayFog.store(
         preferences.InGameFog, std::memory_order_release);
+    FConfiguration::bFirstPerson.store(
+        preferences.FirstPerson, std::memory_order_release);
     FConfiguration::bSprintByDefault.store(
         preferences.SprintByDefault, std::memory_order_release);
     FConfiguration::bForceRespawns.store(
@@ -2308,6 +2316,36 @@ static bool ExecNow(const char* cmd, bool showConsoleErrors = true)
         "command-return path=%s command=%s",
         usedReturnedOutput ? "player-result" : "kismet",
         cmd);
+    command.Free();
+    return true;
+}
+
+bool GUI_ExecuteInternalConsoleCommand(
+    UWorld* world, UObject* controller, const char* commandText)
+{
+    if (!world || !controller || !commandText || !*commandText)
+        return false;
+
+    const int length = MultiByteToWideChar(
+        CP_UTF8, 0, commandText, -1, nullptr, 0);
+    if (length <= 1)
+        return false;
+
+    std::wstring wide(static_cast<size_t>(length), L'\0');
+    if (MultiByteToWideChar(
+            CP_UTF8, 0, commandText, -1,
+            wide.data(), length) != length)
+    {
+        return false;
+    }
+    wide.resize(static_cast<size_t>(length - 1));
+
+    FString command(wide.c_str());
+    AtlasDiagnostics::WriteLine(
+        "internal-command-dispatch world=%p pc=%p command=%s",
+        world, controller, commandText);
+    UKismetSystemLibrary::ExecuteConsoleCommand(
+        world, command, controller);
     command.Free();
     return true;
 }
@@ -4752,7 +4790,9 @@ void GUI_Render()
         fdl->AddLine(ImVec2(wp.x + SidebarW, wp.y + TopBarH), ImVec2(wp.x + SidebarW, wp.y + H), line, 1.f);
     }
 
-    static const char* kTabs[] = { "Main", "Commands", "Config" };
+    static const char* kTabs[] = {
+        "Main", "Commands", "Config", "Credits"
+    };
     const int kTabCount = (int)(sizeof(kTabs) / sizeof(kTabs[0]));
     const float TabH = 40.f;
     const float TabsTop = 12.f;
@@ -4982,6 +5022,9 @@ void GUI_Render()
 
     SectionLabel("Other");
     BeginSectionBody();
+    PersistentCheckbox(
+        "First Person Camera", FConfiguration::bFirstPerson);
+
     if (VersionInfo.FortniteVersion <= 10.40)
     {
         SessionToggleCommandCheckbox(
@@ -4995,10 +5038,6 @@ void GUI_Render()
         FConfiguration::bTargetInfo,
         SettingCommandTargetInfo);
     EndSectionBody();
-
-	ImGui::Spacing();
-
-	ImGui::TextUnformatted("Credit: Plooshi - Erbium Console | Base of the project.");
 
         break;
     }
@@ -5478,6 +5517,68 @@ void GUI_Render()
     EndSectionBody();
 
         ImGui::Dummy(ImVec2(0.f, 8.f));
+        break;
+    }
+    case 3: // Credits
+    {
+        const auto rule = []()
+        {
+            ImDrawList* drawList = ImGui::GetWindowDrawList();
+            const ImVec2 position = ImGui::GetCursorScreenPos();
+            const float width = ImGui::GetContentRegionAvail().x;
+            drawList->AddLine(
+                ImVec2(position.x, position.y + 1.f),
+                ImVec2(position.x + width, position.y + 1.f),
+                ImGui::GetColorU32(Accent(0.30f)), 1.f);
+            ImGui::Dummy(ImVec2(0.f, 9.f));
+        };
+
+        if (FGUI::LogoTexture != ImTextureID_Invalid)
+        {
+            ImGui::Image(FGUI::LogoTexture, ImVec2(44.f, 44.f));
+            ImGui::SameLine(0.f, 12.f);
+        }
+
+        ImGui::BeginGroup();
+        ImGui::PushStyleColor(ImGuiCol_Text, Accent());
+        ImGui::TextUnformatted("ATLAS");
+        ImGui::PopStyleColor();
+        ImGui::PushStyleColor(
+            ImGuiCol_Text, ImVec4(0.54f, 0.56f, 0.62f, 1.f));
+        ImGui::Text("Console  -  %s", FConfiguration::ConsoleVersion);
+        ImGui::PopStyleColor();
+        ImGui::EndGroup();
+
+        ImGui::Dummy(ImVec2(0.f, 14.f));
+        ImGui::PushStyleColor(ImGuiCol_Text, Accent(0.85f));
+        ImGui::TextUnformatted("CREDITS");
+        ImGui::PopStyleColor();
+        rule();
+
+        ImGui::PushStyleColor(ImGuiCol_Text, Accent(0.95f));
+        ImGui::TextUnformatted("Erbium");
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered())
+            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        if (ImGui::IsItemClicked())
+        {
+            ShellExecuteA(
+                nullptr, "open",
+                "https://github.com/plooshi/Erbium",
+                nullptr, nullptr, SW_SHOWNORMAL);
+        }
+        ImGui::SameLine(0.f, 8.f);
+        ImGui::PushStyleColor(
+            ImGuiCol_Text, ImVec4(0.58f, 0.60f, 0.66f, 1.f));
+        ImGui::TextUnformatted("- Base of the project");
+        ImGui::PopStyleColor();
+
+        ImGui::Dummy(ImVec2(0.f, 18.f));
+        ImGui::PushStyleColor(
+            ImGuiCol_Text, ImVec4(0.42f, 0.44f, 0.50f, 1.f));
+        ImGui::TextUnformatted("Thank you for using ATLAS.");
+        ImGui::PopStyleColor();
+
         break;
     }
     }

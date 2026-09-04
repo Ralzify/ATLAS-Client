@@ -2,3 +2,7 @@
 /ATLAS/x64
 /ATLAS/Release/
 /.vs
+/.build/
+/.verification/
+*Tests.exe
+*Tests.obj
