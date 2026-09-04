@@ -301,6 +301,12 @@ static bool HandleArenaSessionBridgeMessage(
 static bool HandleArenaPlacementBridgeMessage(
 	const wchar_t* text, int textLength);
 
+static bool SupportsArenaRuntime()
+{
+	return AtlasPlaylistHudPatchPolicy::ToVersionHundredths(
+		VersionInfo.FortniteVersion) >= 820;
+}
+
 struct FClientMessageView
 {
 	const wchar_t* Data;
@@ -401,7 +407,7 @@ static void CaptureClientMessage(UObject* context, FFrame& stack, void* result)
 	const bool shouldInspectDurianCue =
 		fabs(VersionInfo.FortniteVersion - 27.11) < 0.001 &&
 		g_DurianPhaseSyncInstalled.load(std::memory_order_acquire);
-	const bool shouldInspectArenaBridge = true;
+	const bool shouldInspectArenaBridge = SupportsArenaRuntime();
 
 	const UFunction* function =
 		(shouldCapture || shouldInspectTelemetry ||
@@ -427,12 +433,14 @@ static void CaptureClientMessage(UObject* context, FFrame& stack, void* result)
 			{
 				length--;
 			}
-			if (copied && HandleArenaSessionBridgeMessage(
+			if (copied && shouldInspectArenaBridge &&
+				HandleArenaSessionBridgeMessage(
 				messageCopy, length))
 			{
 				return;
 			}
-			if (copied && HandleArenaPlacementBridgeMessage(
+			if (copied && shouldInspectArenaBridge &&
+				HandleArenaPlacementBridgeMessage(
 				messageCopy, length))
 			{
 				return;
@@ -11673,15 +11681,19 @@ static UWorld* ClientGameThreadTick()
 	static ULONGLONG nextCaptureResolveAt = 0;
 
 	auto world = UWorld::GetWorld();
-	MaintainPendingArenaOwnedScoringAlertRemovals(GetTickCount64());
-	// Reset source ownership before touching a new world's playlist. Otherwise
-	// a verified HUD-owner source from the previous world can strip the only
-	// authored playlist extension during the first maintenance pass.
-	if (world != g_ArenaScoringHudRepair.World)
+	const bool supportsArenaRuntime = SupportsArenaRuntime();
+	if (supportsArenaRuntime)
 	{
-		ResetArenaScoringHudRepair(world);
-		AtlasDiagnostics::WriteLine(
-			"arena-hud world-changed world=%p", world);
+		MaintainPendingArenaOwnedScoringAlertRemovals(GetTickCount64());
+		// Reset source ownership before touching a new world's playlist. Otherwise
+		// a verified HUD-owner source from the previous world can strip the only
+		// authored playlist extension during the first maintenance pass.
+		if (world != g_ArenaScoringHudRepair.World)
+		{
+			ResetArenaScoringHudRepair(world);
+			AtlasDiagnostics::WriteLine(
+				"arena-hud world-changed world=%p", world);
+		}
 	}
 	MaintainCompetitivePlaylistExtensions(world);
 	auto playerController = GetLocalFortPlayerController();
@@ -11701,8 +11713,11 @@ static UWorld* ClientGameThreadTick()
 			static_cast<unsigned>(joinNetDriverState),
 			world, playerController);
 	}
-	MaintainArenaNativeVisualCorrelationScope(
-		world, playerController);
+	if (supportsArenaRuntime)
+	{
+		MaintainArenaNativeVisualCorrelationScope(
+			world, playerController);
+	}
 	if (world != observedSessionWorld)
 	{
 		observedSessionWorld = world;
@@ -11735,18 +11750,21 @@ static UWorld* ClientGameThreadTick()
 	const ULONGLONG now = GetTickCount64();
 	MaintainFirstPersonRuntimeState(
 		world, playerController, frontendActive, now);
-	MaintainArenaConcreteVisualTracePreHud();
-	MaintainArenaScoringHud(world, playerController, now);
-	// Resolve and root the tiny authored badge textures while the Arena HUD is
-	// idle. If an authoritative visual is already queued, skip loading so its
-	// delivery is never held behind synchronous asset work.
-	MaintainArenaDirectBadgeIconPreload();
-	// Retain the post-maintenance pass so legacy builds that lack a discoverable
-	// concrete CDO can still supply functions from the exact live widget.
-	MaintainArenaVisualTrace(playerController, now);
-	MaintainPendingArenaVisualFallbacks(now);
-	MaintainPendingArenaBridgeVisuals(now);
-	MaintainArenaSessionBridgeScore(world, now);
+	if (supportsArenaRuntime)
+	{
+		MaintainArenaConcreteVisualTracePreHud();
+		MaintainArenaScoringHud(world, playerController, now);
+		// Resolve and root the tiny authored badge textures while the Arena HUD is
+		// idle. If an authoritative visual is already queued, skip loading so its
+		// delivery is never held behind synchronous asset work.
+		MaintainArenaDirectBadgeIconPreload();
+		// Retain the post-maintenance pass so legacy builds that lack a discoverable
+		// concrete CDO can still supply functions from the exact live widget.
+		MaintainArenaVisualTrace(playerController, now);
+		MaintainPendingArenaVisualFallbacks(now);
+		MaintainPendingArenaBridgeVisuals(now);
+		MaintainArenaSessionBridgeScore(world, now);
+	}
 	if (playerController &&
 		!g_ClientMessageCaptureInstalled.load(std::memory_order_acquire) &&
 		now >= nextCaptureResolveAt)
@@ -11804,8 +11822,15 @@ static UWorld* ClientGameThreadTick()
 			}
 		}
 
-		MaintainFrontendTournamentRefresh(
-			world, playerController, cheatManager, now);
+		if (supportsArenaRuntime)
+		{
+			MaintainFrontendTournamentRefresh(
+				world, playerController, cheatManager, now);
+		}
+		else
+		{
+			g_FrontendTournamentRefresh = {};
+		}
 	}
 	else if (observedController)
 	{
